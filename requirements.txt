@@ -1,0 +1,16 @@
+transformers>=4.40.0
+datasets>=2.18.0,<3.0.0  # >=3.0 requires torchcodec for Audio decoding
+evaluate>=0.4.0
+jiwer>=3.0.3
+torch>=2.2.0
+torchaudio>=2.2.0
+accelerate>=0.28.0
+peft>=0.10.0           # LoRA (Path B)
+ctranslate2>=4.0.0     # faster-whisper conversion
+faster-whisper>=1.0.0  # Production inference
+whisperx>=3.1.0        # Timestamp alignment
+soundfile>=0.12.1
+librosa>=0.10.1
+tensorboard>=2.16.0
+modal>=0.62.0
+pyyaml>=6.0

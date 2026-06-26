@@ -1,0 +1,44 @@
+model:
+  name: "openai/whisper-medium"
+  language: "ur"           # Primary language token
+  task: "transcribe"
+
+lora:
+  r: 32
+  lora_alpha: 64
+  target_modules: ["q_proj", "v_proj"]
+  lora_dropout: 0.05
+  task_type: "SEQ_2_SEQ_LM"
+
+audio:
+  sampling_rate: 16000
+  max_duration_seconds: 30
+  min_duration_seconds: 1
+
+training:
+  output_dir: "/data/checkpoints/whisper-medium-urdu"
+  per_device_train_batch_size: 16
+  per_device_eval_batch_size: 8
+  gradient_accumulation_steps: 2   # Effective batch = 32
+  learning_rate: 1.0e-5
+  warmup_steps: 500
+  max_steps: 5000
+  gradient_checkpointing: true
+  fp16: true
+  evaluation_strategy: "steps"
+  eval_steps: 500
+  save_steps: 500
+  save_total_limit: 3
+  load_best_model_at_end: true
+  metric_for_best_model: "wer"
+  greater_is_better: false
+  predict_with_generate: true
+  generation_max_length: 225
+  logging_steps: 25
+  report_to: "tensorboard"
+  logging_dir: "/data/logs"
+
+data:
+  train_split: 0.90
+  eval_split: 0.10
+  dataset_path: "/data/processed/dataset"

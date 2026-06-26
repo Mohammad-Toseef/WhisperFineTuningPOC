@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# Virtual environment
+venv/
+.venv/
+
+# Secrets / local env
+.env
+.env.*
+
+# Data pipeline output (regenerable from src/*.py, not source)
+data/
+samples/
+
+# Model artifacts (downloaded/converted locally)
+model/
+checkpoints/
+*.ckpt
+*.bin
+*.safetensors
+
+# Logs
+logs/
+*.log
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
