@@ -13,6 +13,7 @@ Run locally:
     --input_dir ./raw_batch \
     --output_dir ./data/processed/batch1
 """
+import re
 import sys
 import json
 import argparse
@@ -24,6 +25,13 @@ from srt_audio_prep import prepare_from_srt, find_youtube_id
 sys.stdout.reconfigure(encoding="utf-8")
 
 AUDIO_EXTENSIONS = {".mp3", ".wav", ".m4a", ".aac", ".flac"}
+
+
+def natural_sort_key(path: str) -> list:
+    """Split into digit/non-digit chunks so "EP2" sorts before "EP10",
+    unlike plain string or YouTube-ID sorting (both arbitrary w.r.t. episode
+    order)."""
+    return [int(tok) if tok.isdigit() else tok.lower() for tok in re.split(r"(\d+)", Path(path).name)]
 
 
 def find_pairs(input_dir: str) -> list[tuple[str, str]]:
@@ -42,7 +50,7 @@ def find_pairs(input_dir: str) -> list[tuple[str, str]]:
             audio_by_id[youtube_id] = str(path)
 
     pairs = []
-    for youtube_id, audio_path in sorted(audio_by_id.items()):
+    for youtube_id, audio_path in sorted(audio_by_id.items(), key=lambda kv: natural_sort_key(kv[1])):
         srt_path = srt_by_id.get(youtube_id)
         if srt_path is None:
             print(f"  ⚠ no matching .srt for YouTube ID {youtube_id} ({Path(audio_path).name}), skipping")
