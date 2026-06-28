@@ -16,11 +16,13 @@ contain stretches with no corresponding transcript.
 Writes a manifest.json compatible with dataset_builder.py.
 
 Naming convention: chunks are written to
-  audio/vid{NNNN}_{youtube_id}/vid{NNNN}_{youtube_id}_{chunk_idx:03d}.wav
-vid{NNNN} is the sequential --video_index passed in (always present, so
-naming stays consistent even if no YouTube ID can be found); the YouTube ID
-is the 11-char token pulled from the source filename when present, kept for
-traceability back to the original video without a separate lookup file.
+  audio/{video_id}/{video_id}_{chunk_idx:03d}.wav
+where video_id is either:
+  - {episode_label}_{youtube_id}, reusing a short label already in the
+    source filename (e.g. "EP1_hBK8bkFgus8" from "EP1_hBK8bkFgus8.mp3"), or
+  - vid{NNNN}_{youtube_id} (falling back to the sequential --video_index)
+    when the source filename has no such clean label -- e.g. long,
+    auto-downloaded titles. See make_video_id() for the exact rule.
 
 Run locally:
   python src/srt_audio_prep.py \
@@ -45,6 +47,7 @@ sys.stdout.reconfigure(encoding="utf-8")
 
 SRT_TIME_RE = re.compile(r"(\d+):(\d+):(\d+),(\d+)")
 YOUTUBE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
+EPISODE_LABEL_RE = re.compile(r"^[A-Za-z]+\d+$")  # e.g. "EP1", "Episode12" -- short label, no separators
 GAP_THRESHOLD = 3.0  # inter-cue gaps beyond this are treated as non-speech filler, not a pause
 
 
@@ -58,12 +61,24 @@ def find_youtube_id(path: str) -> str | None:
 
 def make_video_id(audio_path: str, video_index: int) -> str:
     """
-    vid{NNNN} (sequential, always present) + the source filename's YouTube
-    ID if one can be found -- short, sortable, and still traceable back to
-    the source video without a separate lookup file.
+    Prefer the source filename's own episode label (e.g. "EP1" in
+    "EP1_hBK8bkFgus8.mp3") + YouTube ID when the filename is already clean --
+    keeps output names consistent with input names for well-named deliveries.
+
+    Falls back to vid{NNNN} (sequential, always present) + YouTube ID when no
+    such label is found -- e.g. the long, messy auto-downloaded filenames seen
+    in practice ("YTDown_YouTube_<80-char-title>_<id>_009_128k.mp3"), where
+    reusing the filename verbatim would reintroduce the unscalable long-name
+    problem this convention was built to avoid.
     """
-    video_id = f"vid{video_index:04d}"
     youtube_id = find_youtube_id(audio_path)
+    if youtube_id:
+        stem_parts = Path(audio_path).stem.split("_")
+        prefix_parts = stem_parts[:stem_parts.index(youtube_id)]
+        if len(prefix_parts) == 1 and EPISODE_LABEL_RE.match(prefix_parts[0]):
+            return f"{prefix_parts[0]}_{youtube_id}"
+
+    video_id = f"vid{video_index:04d}"
     return f"{video_id}_{youtube_id}" if youtube_id else video_id
 
 
