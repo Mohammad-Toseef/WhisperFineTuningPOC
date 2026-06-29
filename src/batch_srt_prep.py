@@ -20,7 +20,7 @@ import argparse
 from pathlib import Path
 from dataclasses import asdict
 
-from srt_audio_prep import prepare_from_srt, find_youtube_id
+from srt_audio_prep import prepare_from_srt, find_youtube_id, make_video_id
 
 sys.stdout.reconfigure(encoding="utf-8")
 
@@ -62,12 +62,34 @@ def find_pairs(input_dir: str) -> list[tuple[str, str]]:
     return pairs
 
 
+def load_existing_manifest(output_dir: str) -> list[dict]:
+    """Load this output_dir's manifest.json if one already exists, so a new
+    batch run can merge in rather than overwrite previously processed videos."""
+    manifest_path = Path(output_dir) / "manifest.json"
+    if not manifest_path.exists():
+        return []
+    with open(manifest_path, encoding="utf-8") as f:
+        return json.load(f)
+
+
 def batch_prepare(input_dir: str, output_dir: str, max_duration: float = 28.0):
     pairs = find_pairs(input_dir)
     print(f"Found {len(pairs)} audio+srt pairs in {input_dir}")
 
-    all_samples = []
+    existing_samples = load_existing_manifest(output_dir)
+    # video_id is the audio chunk's parent folder name -- see make_video_id().
+    already_done = {Path(s["audio_path"]).parent.name for s in existing_samples}
+    if already_done:
+        print(f"Existing manifest has {len(existing_samples)} chunks across {len(already_done)} video(s) -- merging new videos in")
+
+    all_samples = list(existing_samples)
+    new_video_count = 0
     for video_index, (audio_path, srt_path) in enumerate(pairs, start=1):
+        video_id = make_video_id(audio_path, video_index)
+        if video_id in already_done:
+            print(f"\n--- [{video_index}/{len(pairs)}] {Path(audio_path).name}: already in manifest ({video_id}), skipping ---")
+            continue
+
         print(f"\n--- [{video_index}/{len(pairs)}] {Path(audio_path).name} ---")
         try:
             samples = prepare_from_srt(
@@ -77,14 +99,15 @@ def batch_prepare(input_dir: str, output_dir: str, max_duration: float = 28.0):
         except Exception as e:
             print(f"  ✗ failed: {e}, skipping this video")
             continue
-        all_samples.extend(samples)
+        all_samples.extend(asdict(s) for s in samples)
+        new_video_count += 1
 
     manifest_path = Path(output_dir) / "manifest.json"
     with open(manifest_path, "w", encoding="utf-8") as f:
-        json.dump([asdict(s) for s in all_samples], f, ensure_ascii=False, indent=2)
+        json.dump(all_samples, f, ensure_ascii=False, indent=2)
 
-    total_hours = sum(s.duration for s in all_samples) / 3600
-    print(f"\n✅ Batch complete: {len(all_samples)} chunks across {len(pairs)} videos ({total_hours:.2f} hours)")
+    total_hours = sum(s["duration"] for s in all_samples) / 3600
+    print(f"\n✅ Batch complete: {new_video_count} new video(s) processed, {len(all_samples)} total chunks across {len(already_done) + new_video_count} videos ({total_hours:.2f} hours)")
     print(f"   Combined manifest: {manifest_path}")
 
 
