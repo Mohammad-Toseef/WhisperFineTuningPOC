@@ -49,6 +49,12 @@ SRT_TIME_RE = re.compile(r"(\d+):(\d+):(\d+),(\d+)")
 YOUTUBE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
 EPISODE_LABEL_RE = re.compile(r"^[A-Za-z]+\d+$")  # e.g. "EP1", "Episode12" -- short label, no separators
 GAP_THRESHOLD = 3.0  # inter-cue gaps beyond this are treated as non-speech filler, not a pause
+SENTENCE_END_RE = re.compile(r"[۔؟!]\s*$")  # Urdu/Arabic full stop, question mark, or "!" at cue end
+
+
+def ends_sentence(text: str) -> bool:
+    """True if a cue's text ends a complete sentence (Urdu ۔, ؟, or !)."""
+    return bool(SENTENCE_END_RE.search(text.strip()))
 
 
 def find_youtube_id(path: str) -> str | None:
@@ -109,24 +115,46 @@ def group_cues(
     gap_threshold: float = GAP_THRESHOLD,
 ) -> list[tuple[float, float, str]]:
     """
-    Greedily group consecutive cues into windows no longer than max_duration.
+    Greedily group consecutive cues into windows no longer than max_duration,
+    preferring to break at a sentence boundary (cue text ending in ۔ ؟ !)
+    over a mid-sentence cut. When growing the window would exceed
+    max_duration, the window is split right after its last sentence-ending
+    cue rather than wherever the duration limit happens to land -- avoids
+    training the model that mid-utterance truncation is acceptable output.
+    Falls back to the old hard duration cut if no sentence boundary exists
+    anywhere in the window (rare run-on speech with no punctuated cue).
+
     Also forces a new window whenever the gap before a cue exceeds
     gap_threshold, regardless of accumulated duration -- such gaps usually
     mean non-speech filler (music, intro/outro) rather than a normal pause.
     """
     chunks = []
     current = []
+    last_sentence_end = -1  # index within `current` of its last sentence-ending cue
+
     for cue in cues:
         if current:
-            total_span = cue[1] - current[0][0]
             gap_before = cue[0] - current[-1][1]
-            if total_span > max_duration or gap_before > gap_threshold:
+            prospective_span = cue[1] - current[0][0]
+            if gap_before > gap_threshold:
                 chunks.append(current)
-                current = [cue]
-            else:
-                current.append(cue)
-        else:
-            current.append(cue)
+                current, last_sentence_end = [], -1
+            elif prospective_span > max_duration:
+                if last_sentence_end >= 0:
+                    chunks.append(current[: last_sentence_end + 1])
+                    current = current[last_sentence_end + 1 :]
+                else:
+                    # No sentence boundary anywhere in this window -- nothing
+                    # better to split on, so keep the old fixed-duration cut.
+                    chunks.append(current)
+                    current = []
+                last_sentence_end = next(
+                    (i for i in range(len(current) - 1, -1, -1) if ends_sentence(current[i][2])),
+                    -1,
+                )
+        current.append(cue)
+        if ends_sentence(cue[2]):
+            last_sentence_end = len(current) - 1
     if current:
         chunks.append(current)
 
