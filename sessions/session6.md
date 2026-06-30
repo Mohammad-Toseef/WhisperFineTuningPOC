@@ -15,14 +15,16 @@ the Manifest Analysis Report.
 - Root cause of Issue 10: `group_cues()` in `src/srt_audio_prep.py` only broke
   chunks on `max_duration` overflow or inter-cue gap, never on sentence-ending
   punctuation (۔ ؟ !), so chunks routinely landed mid-utterance.
-- Fix (Option A from the report): added `ends_sentence()` + reworked
-  `group_cues()` to prefer splitting right after the last sentence-ending cue
-  when growing the window would exceed `max_duration`, falling back to the
-  old hard duration cut only when no sentence boundary exists anywhere in the
-  window (e.g. long Quranic recitation/monologue with no punctuated cue).
-- Re-ran `batch_srt_prep.py` against `samples/28JulyBatch/` into a **new**
-  output dir `data/processed/Batch1_EP10/` (left `batch_28july/` untouched, per
-  user's choice) — confirms the fix without destroying the prior batch.
+- Fix iteration 1: added `ends_sentence()` + reworked `group_cues()` to prefer
+  splitting right after the last sentence-ending cue (۔ ؟ !) when the window
+  would exceed `max_duration`.
+- Fix iteration 2: added `ends_clause()` + ، (Urdu comma) as a second-priority
+  fallback tier between sentence-end and hard cut, rescuing 33 more chunks.
+- Final three-tier split priority: (1) ۔ ؟ ! → (2) ، → (3) hard duration cut.
+- Residual 23.6% hard-cut samples assessed and kept for POC — content value
+  (dense Urdu/Arabic) outweighs mild EOT boundary risk under LoRA.
+- Re-ran full batch into `data/processed/Batch1_EP10/` (canonical going forward);
+  old `batch_28july/` can be archived or deleted.
 
 ## Open Items / TODOs
 - Carried over: manual listen+read spot-check of EP6-EP10 chunks still not done.
@@ -39,20 +41,22 @@ the Manifest Analysis Report.
 ## Next Steps
 - Run the normalization script (diacritics/Unicode/spacing fixes, steps 3-8
   of the report's Action Plan) against `data/processed/Batch1_EP10/manifest.json`.
-- Exclude index 608 (`EP10_0n12YXValEk_062.wav`).
-- Review the residual ~29% truncated entries manually (run-on sentences with
-  no punctuation) — decide whether to merge across chunk boundaries or accept
-  as-is.
-- Decide whether `Batch1_EP10/` replaces `batch_28july/` as the canonical
-  manifest going forward, or both are kept temporarily for comparison.
+- Exclude index 608 (`EP10_0n12YXValEk_062.wav`) — catastrophic alignment
+  failure (28s audio, 8-char transcript "ہوگا، تو").
+- Residual 23.6% hard-cut samples: keep for POC, revisit only if post-training
+  inference shows early-cutoff artifacts.
+- Archive or delete `batch_28july/` — `Batch1_EP10/` is now canonical.
 
 ## Summary
-Resolved Issue 10 (chunk boundary truncation) by making `group_cues()` in
-`src/srt_audio_prep.py` split at sentence-ending punctuation (۔ ؟ !) instead
-of purely at fixed time/duration boundaries, with a fallback to the old hard
-cut only when no sentence boundary exists in the window. Verified against all
-10 episodes in `samples/28JulyBatch/`: truncation dropped from 58% (310/535)
-to 28.8% (176/611), with remaining cases being genuine run-on speech rather
-than algorithm misses. Re-ran the full batch into a new directory
-(`data/processed/Batch1_EP10/`) to avoid overwriting the existing
-`batch_28july/` manifest.
+Resolved Issue 10 (chunk boundary truncation) across two fix iterations in
+`src/srt_audio_prep.py → group_cues()`:
+
+1. Added sentence-boundary splitting (۔ ؟ !) as the primary split point.
+2. Added ، (Urdu comma) as a second-priority clause-boundary fallback.
+
+Final outcome for `data/processed/Batch1_EP10/` (618 chunks, 3.17 hrs):
+71.0% complete sentences · 5.3% clause boundaries · 23.6% unavoidable hard cuts.
+Down from 58% truncated in the original `batch_28july/` manifest.
+
+Also created `Issues_Fix.md` at the project root to track all pipeline fixes
+going forward.

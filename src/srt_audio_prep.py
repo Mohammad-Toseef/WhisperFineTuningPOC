@@ -49,12 +49,18 @@ SRT_TIME_RE = re.compile(r"(\d+):(\d+):(\d+),(\d+)")
 YOUTUBE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
 EPISODE_LABEL_RE = re.compile(r"^[A-Za-z]+\d+$")  # e.g. "EP1", "Episode12" -- short label, no separators
 GAP_THRESHOLD = 3.0  # inter-cue gaps beyond this are treated as non-speech filler, not a pause
-SENTENCE_END_RE = re.compile(r"[۔؟!]\s*$")  # Urdu/Arabic full stop, question mark, or "!" at cue end
+SENTENCE_END_RE = re.compile(r"[۔؟!]\s*$")   # Urdu/Arabic full stop, question mark, or "!"
+CLAUSE_END_RE   = re.compile(r"،\s*$")         # Urdu comma — clause boundary, second-priority split
 
 
 def ends_sentence(text: str) -> bool:
     """True if a cue's text ends a complete sentence (Urdu ۔, ؟, or !)."""
     return bool(SENTENCE_END_RE.search(text.strip()))
+
+
+def ends_clause(text: str) -> bool:
+    """True if a cue's text ends at an Urdu comma (clause boundary)."""
+    return bool(CLAUSE_END_RE.search(text.strip()))
 
 
 def find_youtube_id(path: str) -> str | None:
@@ -130,7 +136,8 @@ def group_cues(
     """
     chunks = []
     current = []
-    last_sentence_end = -1  # index within `current` of its last sentence-ending cue
+    last_sentence_end = -1  # index within `current` of its last ۔/؟/! cue
+    last_clause_end   = -1  # index within `current` of its last ، cue (fallback)
 
     for cue in cues:
         if current:
@@ -138,23 +145,36 @@ def group_cues(
             prospective_span = cue[1] - current[0][0]
             if gap_before > gap_threshold:
                 chunks.append(current)
-                current, last_sentence_end = [], -1
+                current, last_sentence_end, last_clause_end = [], -1, -1
             elif prospective_span > max_duration:
                 if last_sentence_end >= 0:
-                    chunks.append(current[: last_sentence_end + 1])
-                    current = current[last_sentence_end + 1 :]
+                    # Priority 1: split at the last complete-sentence boundary.
+                    split = last_sentence_end
+                elif last_clause_end >= 0:
+                    # Priority 2: split at the last clause boundary (،).
+                    split = last_clause_end
                 else:
-                    # No sentence boundary anywhere in this window -- nothing
-                    # better to split on, so keep the old fixed-duration cut.
-                    chunks.append(current)
-                    current = []
+                    # Priority 3: no punctuation boundary at all — hard cut.
+                    split = len(current) - 1
+
+                chunks.append(current[: split + 1])
+                current = current[split + 1 :]
+
+                # Recompute tracked indices for the cues that carried over.
                 last_sentence_end = next(
                     (i for i in range(len(current) - 1, -1, -1) if ends_sentence(current[i][2])),
                     -1,
                 )
+                last_clause_end = next(
+                    (i for i in range(len(current) - 1, -1, -1) if ends_clause(current[i][2])),
+                    -1,
+                )
+
         current.append(cue)
         if ends_sentence(cue[2]):
             last_sentence_end = len(current) - 1
+        if ends_clause(cue[2]):
+            last_clause_end = len(current) - 1
     if current:
         chunks.append(current)
 
