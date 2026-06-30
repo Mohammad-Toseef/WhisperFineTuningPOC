@@ -17,6 +17,9 @@ This file is a practical entry point — what exists, what works, and how to run
 - `src/normalize_manifest.py` cleans transcripts in a manifest — expands
   Unicode shorthand symbols, removes invisible characters, fixes punctuation spacing.
 - `src/dataset_builder.py` converts a manifest into a HuggingFace dataset.
+- `scripts/convert_reviewed_manifest.py` converts a reviewed manifest exported
+  from the review portal back to the standard `manifest.json` format (auto-detects
+  the matching local batch folder).
 - Validated end-to-end on EP1–EP23: **1,336 chunks · 6.92 hours**.
 
 **Training — LoRA wired in, not yet run.**
@@ -63,6 +66,8 @@ container — see the `image` definition in `modal_app.py`.
 │   ├── batch_srt_prep.py       ← Audio+SRT → manifest (batch, matched by YouTube ID)
 │   ├── normalize_manifest.py   ← Transcript normalization (Unicode, punctuation)
 │   └── dataset_builder.py      ← manifest.json → HuggingFace dataset
+├── scripts/
+│   └── convert_reviewed_manifest.py  ← Convert review-portal export back to manifest.json format
 ├── data/processed/             ← Local data prep output (gitignored)
 ├── samples/                    ← Raw sample audio+SRT inputs (gitignored)
 └── sessions/                   ← Running session notes/log (session1.md, session2.md, ...)
@@ -133,7 +138,37 @@ marks such as `اِس` (zer = "this") vs `اُس` (pesh = "that").
 
 ---
 
-### Step 3 — Build HuggingFace dataset
+### Step 3 — Convert reviewed manifest from the review portal
+
+After human reviewers correct transcripts in the review portal and export the
+result (a flat JSON list with extra fields like `audio_s3_key`, `batch_name`,
+`episode_label`, `youtube_video_id`, `chunk_index`, `status`), run this script
+to convert it back to the standard `manifest.json` format.
+
+The script auto-detects the correct local batch folder by comparing
+`(episode_label, youtube_video_id, chunk_index)` tuples across all manifests
+under `data/processed/`, using Jaccard similarity to avoid false matches when
+multiple batch folders share the same episodes.
+
+```bash
+# Default: reads "all_batches_reviewed_manifest (1).json" from cwd,
+# writes data/processed/<matched_batch>/manifest_reviewed.json
+python scripts/convert_reviewed_manifest.py
+
+# Custom input file
+python scripts/convert_reviewed_manifest.py path/to/reviewed_export.json
+
+# Write directly to manifest.json (overwrites — only when satisfied with review)
+python scripts/convert_reviewed_manifest.py \
+  --output data/processed/my_batch/manifest.json
+```
+
+The output keeps only the four standard fields: `audio_path`, `transcript`,
+`duration`, `language`. Run `normalize_manifest.py` on it afterwards if needed.
+
+---
+
+### Step 4 — Build HuggingFace dataset
 
 ```bash
 python src/dataset_builder.py
@@ -143,6 +178,11 @@ python src/dataset_builder.py
 
 See `CLAUDE.MD` for the Modal upload/train/evaluate/download commands —
 those are documented but not all implemented yet (see Status above).
+
+**Typical full data-prep sequence:**
+```
+batch_srt_prep.py  →  normalize_manifest.py  →  (review portal)  →  convert_reviewed_manifest.py  →  dataset_builder.py
+```
 
 ## Notes
 
