@@ -62,3 +62,35 @@ Kept in training data for the POC. Reasoning:
   `SENTENCE_END_RE`, `CLAUSE_END_RE`
 
 ---
+
+## Issues 3–8 — Unicode Normalization
+
+**Severity:** HIGH (presentation-form ligatures Whisper cannot output)  
+**Status:** FIXED  
+**Affected:** 167 / 618 entries (244 total character replacements)  
+**Fixed in:** `src/normalize_manifest.py`  
+**Output:** `data/processed/Batch1_EP10/manifest_normalized.json`  
+**Date:** 2026-06-30
+
+### Changes Applied
+
+| Rule | Count | Treatment |
+|------|-------|-----------|
+| ﷺ (U+FDFA) | 221 | → `صَلَّى اللَّهُ عَلَيْهِ وَسَلَّمَ` |
+| ؐ (U+0610) combining salawat | 3 | → `صَلَّى اللَّهُ عَلَيْهِ وَسَلَّمَ` |
+| ؑ (U+0611) combining alayhe assalam | 17 | → `عَلَیْہِ السَّلَام` |
+| ؓ (U+0613) combining radi allahu anhu | 2 | → `رَضِیَ اللَّهُ عَنْہُ` |
+| U+200C ZWNJ | 1 | Removed |
+| Issue 5b: space before ۔ | 71 | Removed — `کہا ۔` → `کہا۔` |
+| Issue 5a: no space after ، | 8 | Added — `کہا،اور` → `کہا، اور` |
+
+### Intentionally Left Unchanged
+- All Arabic/Urdu diacritics (harakat) — kept, including aِس/اُس disambiguating cases
+- بھئی — valid colloquial Urdu, not a transcription error
+- Curly quotes `" "`, em dash `—` — negligible count, Whisper tokenizer handles them
+- Arabic ي/ك in Quranic text — correct Arabic script, not Urdu typos
+
+### Files changed
+- `src/normalize_manifest.py` — new script
+
+---
