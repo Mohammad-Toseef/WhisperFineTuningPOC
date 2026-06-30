@@ -64,10 +64,20 @@ def ends_clause(text: str) -> bool:
 
 
 def find_youtube_id(path: str) -> str | None:
-    """Pull an 11-char YouTube video ID from a filename, if present."""
-    for part in Path(path).stem.split("_"):
-        if YOUTUBE_ID_RE.match(part):
-            return part
+    """Pull an 11-char YouTube video ID from a filename, if present.
+
+    Scans right-to-left for the first 11-char window that matches the YouTube
+    ID pattern and is preceded by '_' or the start of the stem.  Right-to-left
+    order ensures we find the ID (always the rightmost token) before any
+    episode-label prefix, and handles IDs that themselves contain '_'.
+    """
+    stem = Path(path).stem
+    for i in range(len(stem) - 11, -1, -1):
+        if i > 0 and stem[i - 1] != "_":
+            continue
+        candidate = stem[i:i + 11]
+        if YOUTUBE_ID_RE.match(candidate):
+            return candidate
     return None
 
 
@@ -85,8 +95,10 @@ def make_video_id(audio_path: str, video_index: int) -> str:
     """
     youtube_id = find_youtube_id(audio_path)
     if youtube_id:
-        stem_parts = Path(audio_path).stem.split("_")
-        prefix_parts = stem_parts[:stem_parts.index(youtube_id)]
+        stem = Path(audio_path).stem
+        id_pos = stem.rfind(youtube_id)
+        prefix = stem[:id_pos].rstrip("_")
+        prefix_parts = prefix.split("_") if prefix else []
         if len(prefix_parts) == 1 and EPISODE_LABEL_RE.match(prefix_parts[0]):
             return f"{prefix_parts[0]}_{youtube_id}"
 
