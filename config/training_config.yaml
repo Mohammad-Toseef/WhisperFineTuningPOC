@@ -1,5 +1,5 @@
 model:
-  name: "openai/whisper-medium"
+  name: "openai/whisper-large-v3"   # POC base model (1.5B params, 128 mel bins)
   language: "ur"           # Primary language token
   task: "transcribe"
 
@@ -8,7 +8,9 @@ lora:
   lora_alpha: 64
   target_modules: ["q_proj", "v_proj"]
   lora_dropout: 0.05
-  task_type: "SEQ_2_SEQ_LM"
+  # task_type MUST be null for Whisper. Setting SEQ_2_SEQ_LM makes PEFT feed
+  # `input_ids` to the base model, but Whisper.forward() takes `input_features`.
+  task_type: null
 
 audio:
   sampling_rate: 16000
@@ -16,18 +18,20 @@ audio:
   min_duration_seconds: 1
 
 training:
-  output_dir: "/data/checkpoints/whisper-medium-urdu"
-  per_device_train_batch_size: 16
-  per_device_eval_batch_size: 8
-  gradient_accumulation_steps: 2   # Effective batch = 32
+  output_dir: "/data/checkpoints/whisper-large-v3-urdu"
+  per_device_train_batch_size: 8   # large-v3 on A10G 24GB; drop to 4 if OOM
+  per_device_eval_batch_size: 4
+  gradient_accumulation_steps: 4   # Effective batch = 32
   learning_rate: 1.0e-5
-  warmup_steps: 500
-  max_steps: 5000
+  warmup_steps: 20
+  # POC smoke test: 535 clips ~= 15 steps/epoch @ eff-batch 32.
+  # 120 steps ~= 8 epochs. Raise for the real 23-episode run.
+  max_steps: 120
   gradient_checkpointing: true
   fp16: true
   evaluation_strategy: "steps"
-  eval_steps: 500
-  save_steps: 500
+  eval_steps: 30
+  save_steps: 30
   save_total_limit: 3
   load_best_model_at_end: true
   metric_for_best_model: "wer"

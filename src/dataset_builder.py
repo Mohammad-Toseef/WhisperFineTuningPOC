@@ -45,7 +45,9 @@ def build_dataset(manifest_path: str, output_path: str,
 
 
 if __name__ == "__main__":
-    build_dataset(
-        manifest_path="./data/processed/manifest.json",
-        output_path="./data/processed/dataset"
-    )
+    # POC: build from the reviewed manifest. Override via CLI args if needed:
+    #   python src/dataset_builder.py <manifest_path> <output_path>
+    manifest = sys.argv[1] if len(sys.argv) > 1 else \
+        "./data/processed/Batch1_EP23/manifest_reviewed.json"
+    output = sys.argv[2] if len(sys.argv) > 2 else "./data/processed/dataset"
+    build_dataset(manifest_path=manifest, output_path=output)

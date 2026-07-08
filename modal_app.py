@@ -15,19 +15,27 @@ app = modal.App("whisper-urdu-poc")
 volume = modal.Volume.from_name("whisper-training-vol", create_if_missing=True)
 VOLUME_PATH = "/data"
 
+# Model save locations on the volume (shared by train / evaluate / transcribe)
+ADAPTER_PATH = f"{VOLUME_PATH}/model/whisper-urdu-lora-adapter"
+FINAL_MODEL_PATH = f"{VOLUME_PATH}/model/whisper-urdu-final"
+
 # Container image with all ML dependencies
 image = (
     modal.Image.debian_slim(python_version="3.11")
     .apt_install("ffmpeg", "git")
     .pip_install([
-        "transformers>=4.40.0",
+        # Pinned upper bounds — unbounded >=X pulls transformers 5.x / torch 2.12
+        # / numpy 2.4, which break Seq2SeqTrainer's evaluation_strategy/tokenizer
+        # API and the forced_decoder_ids generate path.
+        "transformers>=4.40.0,<4.46",
         "datasets>=2.18.0,<3.0.0",  # >=3.0 requires torchcodec for Audio decoding
-        "evaluate>=0.4.0",
-        "jiwer>=3.0.3",
-        "torch>=2.2.0",
-        "torchaudio>=2.2.0",
-        "accelerate>=0.28.0",
-        "peft>=0.10.0",       # LoRA (Path B)
+        "evaluate>=0.4.0,<0.5",
+        "jiwer>=3.0.3,<4.0",
+        "torch>=2.2.0,<2.5",
+        "torchaudio>=2.2.0,<2.5",
+        "accelerate>=0.28.0,<1.0",
+        "peft>=0.10.0,<0.14",       # LoRA (Path B)
+        "numpy<2.0",
         "soundfile>=0.12.1",
         "librosa>=0.10.1",
         "tensorboard>=2.16.0",
@@ -89,7 +97,7 @@ def train():
         lora_alpha=l_cfg["lora_alpha"],
         target_modules=l_cfg["target_modules"],
         lora_dropout=l_cfg["lora_dropout"],
-        task_type=l_cfg["task_type"],
+        task_type=l_cfg.get("task_type"),  # None for Whisper (see config comment)
     )
     model = get_peft_model(model, lora_config)
     # Required with gradient checkpointing + frozen base weights, otherwise
@@ -199,18 +207,146 @@ def train():
     trainer.train()
 
     print("💾 Saving LoRA adapter to volume...")
-    adapter_save_path = f"{VOLUME_PATH}/model/whisper-medium-urdu-lora-adapter"
-    model.save_pretrained(adapter_save_path)
-    processor.save_pretrained(adapter_save_path)
+    model.save_pretrained(ADAPTER_PATH)
+    processor.save_pretrained(ADAPTER_PATH)
 
     print("🔀 Merging adapter into base model for production format...")
     merged_model = model.merge_and_unload()
-    model_save_path = f"{VOLUME_PATH}/model/whisper-medium-urdu-final"
-    merged_model.save_pretrained(model_save_path)
-    processor.save_pretrained(model_save_path)
+    merged_model.save_pretrained(FINAL_MODEL_PATH)
+    processor.save_pretrained(FINAL_MODEL_PATH)
     volume.commit()
 
-    print(f"✅ Training complete. Model saved to {model_save_path}")
+    print(f"✅ Training complete. Model saved to {FINAL_MODEL_PATH}")
+
+
+# ── Evaluation (baseline vs fine-tuned WER) ──────────────────────────
+@app.function(
+    image=image,
+    gpu="A10G",           # large-v3 generate; A10G comfortably fits it
+    timeout=60 * 60 * 2,
+    volumes={VOLUME_PATH: volume},
+    memory=32768,
+)
+def evaluate(which: str = "both"):
+    """
+    Compute WER on the held-out eval split.
+
+    which = "base"      → frozen base model only (the baseline)
+            "finetuned" → fine-tuned model only
+            "both"      → run both over the SAME clips and print side by side
+
+    Run:
+      modal run modal_app.py::evaluate                 # both
+      modal run modal_app.py::evaluate --which base    # baseline only
+    """
+    import re
+    import json
+    import yaml
+    import torch
+    from datasets import load_from_disk, Audio
+    from transformers import WhisperProcessor, WhisperForConditionalGeneration
+    import evaluate as hf_evaluate
+
+    with open(f"{VOLUME_PATH}/config/training_config.yaml") as f:
+        cfg = yaml.safe_load(f)
+    base_name = cfg["model"]["name"]
+    language = cfg["model"]["language"]
+    task = cfg["model"]["task"]
+
+    # ── Load the SAME held-out eval split used in training ──────────
+    dataset = load_from_disk(cfg["data"]["dataset_path"])
+    dataset = dataset.cast_column("audio", Audio(sampling_rate=16000))
+    eval_ds = dataset["eval"]
+    references = [s for s in eval_ds["sentence"]]
+    print(f"📏 Evaluating on {len(eval_ds)} held-out clips.")
+
+    wer_metric = hf_evaluate.load("wer")
+
+    # WER text normalizer — applied EQUALLY to base & fine-tuned so the
+    # comparison is fair. Strips punctuation (Urdu + Latin) and collapses
+    # whitespace; keeps diacritics (they are part of the target labels).
+    _punct = r"[۔،؛؟!?.,:;\"'“”‘’()\-—…]"
+    def normalize(text: str) -> str:
+        text = re.sub(_punct, " ", text)
+        return re.sub(r"\s+", " ", text).strip()
+
+    def run_model(model_path: str, label: str) -> dict:
+        print(f"\n🔎 Loading {label}: {model_path}")
+        processor = WhisperProcessor.from_pretrained(
+            model_path, language=language, task=task
+        )
+        model = WhisperForConditionalGeneration.from_pretrained(model_path)
+        model = model.to("cuda").eval()
+        forced_decoder_ids = processor.get_decoder_prompt_ids(
+            language=language, task=task
+        )
+
+        preds = []
+        batch_size = 8
+        for i in range(0, len(eval_ds), batch_size):
+            batch = eval_ds[i : i + batch_size]
+            arrays = [a["array"] for a in batch["audio"]]
+            sr = batch["audio"][0]["sampling_rate"]
+            feats = processor.feature_extractor(
+                arrays, sampling_rate=sr, return_tensors="pt"
+            ).input_features.to("cuda", dtype=model.dtype)
+            with torch.no_grad():
+                pred_ids = model.generate(
+                    feats,
+                    forced_decoder_ids=forced_decoder_ids,
+                    max_new_tokens=225,
+                )
+            preds.extend(
+                processor.batch_decode(pred_ids, skip_special_tokens=True)
+            )
+            print(f"   {min(i + batch_size, len(eval_ds))}/{len(eval_ds)} clips")
+
+        raw_wer = 100 * wer_metric.compute(predictions=preds, references=references)
+        norm_wer = 100 * wer_metric.compute(
+            predictions=[normalize(p) for p in preds],
+            references=[normalize(r) for r in references],
+        )
+        del model
+        torch.cuda.empty_cache()
+        print(f"   → {label}: raw WER {raw_wer:.2f}% | normalized WER {norm_wer:.2f}%")
+        return {"label": label, "raw_wer": raw_wer, "norm_wer": norm_wer, "predictions": preds}
+
+    import os
+    results = {}
+    if which in ("base", "both"):
+        results["base"] = run_model(base_name, f"BASE ({base_name})")
+    if which in ("finetuned", "both"):
+        if not os.path.exists(FINAL_MODEL_PATH):
+            print(f"⚠️  Fine-tuned model not found at {FINAL_MODEL_PATH} — run train first.")
+        else:
+            results["finetuned"] = run_model(FINAL_MODEL_PATH, "FINE-TUNED")
+
+    # ── Report ─────────────────────────────────────────────────────
+    print("\n" + "=" * 60)
+    print("  WER RESULTS (held-out eval split)")
+    print("=" * 60)
+    for key in ("base", "finetuned"):
+        if key in results:
+            r = results[key]
+            print(f"  {r['label']:<32} raw {r['raw_wer']:6.2f}%  |  norm {r['norm_wer']:6.2f}%")
+    if "base" in results and "finetuned" in results:
+        delta = results["base"]["norm_wer"] - results["finetuned"]["norm_wer"]
+        print("-" * 60)
+        print(f"  Improvement (normalized WER):   {delta:+.2f} points")
+    print("=" * 60)
+
+    # Persist results to the volume for later reference
+    os.makedirs(f"{VOLUME_PATH}/logs", exist_ok=True)
+    out = {
+        k: {kk: vv for kk, vv in v.items() if kk != "predictions"}
+        for k, v in results.items()
+    }
+    out["n_clips"] = len(eval_ds)
+    with open(f"{VOLUME_PATH}/logs/eval_results.json", "w", encoding="utf-8") as f:
+        json.dump(out, f, ensure_ascii=False, indent=2)
+    volume.commit()
+    print(f"💾 Results saved to {VOLUME_PATH}/logs/eval_results.json")
+    return out
 
 
 # ── Batch Transcription ──────────────────────────────────────────────
@@ -226,9 +362,8 @@ def transcribe_batch(audio_paths: list[str]) -> list[dict]:
     import librosa
     from transformers import WhisperProcessor, WhisperForConditionalGeneration
 
-    model_path = f"{VOLUME_PATH}/model/whisper-medium-urdu-final"
-    processor = WhisperProcessor.from_pretrained(model_path)
-    model = WhisperForConditionalGeneration.from_pretrained(model_path)
+    processor = WhisperProcessor.from_pretrained(FINAL_MODEL_PATH)
+    model = WhisperForConditionalGeneration.from_pretrained(FINAL_MODEL_PATH)
     model = model.to("cuda")
     model.eval()
 

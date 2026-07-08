@@ -1,7 +1,7 @@
-# Whisper Medium Fine-Tuning POC
+# Whisper Large-v3 Fine-Tuning POC
 
 ## Project Goal
-Fine-tune OpenAI Whisper Medium on a single Urdu/English/Arabic code-switching
+Fine-tune OpenAI Whisper Large-v3 on a single Urdu/English/Arabic code-switching
 speaker for accurate batch transcription (text + timestamps) of 4,000+ videos.
 
 ---
@@ -9,7 +9,7 @@ speaker for accurate batch transcription (text + timestamps) of 4,000+ videos.
 ## Stack
 - **Development:** Claude Code (this environment)
 - **Training Platform:** Modal (modal.com)
-- **Base Model:** openai/whisper-medium (300M parameters)
+- **Base Model:** openai/whisper-large-v3 (1.5B parameters, 128 mel bins)
 - **Training Framework:** HuggingFace Transformers + Seq2SeqTrainer
 - **Efficient Fine-tuning:** PEFT (LoRA) — Path B
 - **Production Inference:** faster-whisper (CTranslate2 runtime)
@@ -104,16 +104,11 @@ manually transcribe for training:
 - Max chunk length: **28 seconds** (2s buffer under Whisper's 30s hard limit)
 - Min chunk length: 1 second (discard shorter segments)
 
-### Audio Format
-- 16kHz mono WAV
-- Max chunk length: **28 seconds** (leaves 2s buffer under Whisper's 30s hard limit)
-- Min chunk length: 1 second (discard shorter segments)
-
 ### Fine-Tuning Approach: Path B (LoRA) for POC
 We use **LoRA (Path B)** during the POC phase:
 - Freezes base Whisper weights entirely — no catastrophic forgetting
-- ~6GB VRAM vs ~12GB for full fine-tuning
-- ~60MB adapter file vs ~1.5GB full checkpoint
+- ~10–12GB VRAM for large-v3 + LoRA (fits the A10G 24GB comfortably)
+- ~60MB adapter file vs ~3GB full checkpoint
 - ~1.5x faster training — cheaper to iterate
 - At 3–10 hours of training data, accuracy difference vs full fine-tuning is <2% WER
 
@@ -127,10 +122,16 @@ LoraConfig(
     lora_alpha=64,
     target_modules=["q_proj", "v_proj"],
     lora_dropout=0.05,
-    task_type="SEQ_2_SEQ_LM"
+    task_type=None,   # MUST be None for Whisper — see note below
 )
-# Trainable: ~15M / 300M params (5%)
+# Trainable: ~15.7M / 1.56B params (1.0%)
 ```
+
+> ⚠️ **`task_type` must be `None` for Whisper.** Setting `task_type="SEQ_2_SEQ_LM"`
+> makes PEFT wrap the model as `PeftModelForSeq2SeqLM`, whose forward pass feeds
+> `input_ids` to the base model — but `WhisperForConditionalGeneration.forward()`
+> takes `input_features`, not `input_ids`, and training crashes on step 0 with
+> `TypeError: ... got an unexpected keyword argument 'input_ids'`.
 
 ### Timestamps: Fine-tuning + WhisperX Alignment
 Whisper generates two types of timestamps:
@@ -212,21 +213,36 @@ Build and expand this dictionary from the first batch of transcriptions.
 ### Resources
 - **App name:** `whisper-urdu-poc`
 - **Volume name:** `whisper-training-vol` (persists data + checkpoints + final model)
-- **Training GPU:** A10G (24GB VRAM, ~$1.10/hr) — fits Whisper medium + LoRA comfortably
+- **Training GPU:** A10G (24GB VRAM, ~$1.10/hr) — fits Whisper large-v3 + LoRA comfortably
 - **Inference GPU:** T4 (16GB VRAM, ~$0.59/hr) — sufficient for faster-whisper INT8
 
 ### Volume Layout
 ```
-/data/
+/data/                               # volume is MOUNTED at /data (see caveat below)
 ├── config/                          # training_config.yaml
 ├── processed/                       # HuggingFace dataset (.arrow format)
-├── checkpoints/                     # Training checkpoints (saved every 500 steps)
-│   └── whisper-medium-urdu/
+├── checkpoints/                     # Training checkpoints
+│   └── whisper-large-v3-urdu/
 ├── model/
-│   ├── whisper-medium-urdu-final/   # HuggingFace format (post-training)
+│   ├── whisper-urdu-lora-adapter/   # LoRA adapter only (~60MB)
+│   ├── whisper-urdu-final/          # Merged HuggingFace format (post-training)
 │   └── ct2/                         # CTranslate2 format (post-conversion)
-└── logs/                            # TensorBoard logs
+└── logs/                            # TensorBoard logs + eval_results.json
 ```
+
+> ⚠️ **Volume upload paths are ROOT-RELATIVE, not `/data/...`.** The volume is
+> *mounted at* `/data` inside the container, so its own root is what becomes
+> `/data`. Uploading to remote path `/data/config` creates `/data/data/config/...`
+> at runtime and the code can't find it. Upload to `/config` and `/processed/...`:
+> ```powershell
+> modal volume put whisper-training-vol ./config /config
+> modal volume put whisper-training-vol ./data/processed/dataset /processed/dataset
+> ```
+
+> ⚠️ **Use PowerShell (not Git Bash) for the `modal` CLI on Windows.** Git Bash
+> rewrites remote paths like `/config` into `/C:/Program Files/Git/config`
+> (MSYS path conversion). Also set `PYTHONIOENCODING=utf-8` and `PYTHONUTF8=1`
+> so Modal's ✓ progress glyphs don't crash with a cp1252 encoding error.
 
 ### Important
 Modal Volumes are **not permanent** — always download and push the final model
@@ -240,18 +256,18 @@ The fine-tuned model is standard HuggingFace format. No Modal lock-in.
 **Download from Modal Volume:**
 ```bash
 modal volume get whisper-training-vol \
-  /data/model/whisper-medium-urdu-final ./model/final
+  /model/whisper-urdu-final ./model/final
 ```
 
 **Push to HuggingFace Hub (do this immediately after training):**
 ```python
-model.push_to_hub("your-org/whisper-medium-urdu", private=True)
-processor.push_to_hub("your-org/whisper-medium-urdu", private=True)
+model.push_to_hub("your-org/whisper-large-v3-urdu", private=True)
+processor.push_to_hub("your-org/whisper-large-v3-urdu", private=True)
 ```
 
 **Use anywhere after that:**
 ```python
-model = WhisperForConditionalGeneration.from_pretrained("your-org/whisper-medium-urdu")
+model = WhisperForConditionalGeneration.from_pretrained("your-org/whisper-large-v3-urdu")
 ```
 
 ---
@@ -298,12 +314,18 @@ whisper-urdu-finetuning/
 ---
 
 ## WER Targets
-| Stage | Expected WER |
+> Note: original targets assumed whisper-medium (~35–45% base). Large-v3 is far
+> stronger on Urdu — the measured base on our Nastaliq-heavy eval set was ~17%
+> normalized, so absolute WER numbers below are lower than a medium-based plan.
+
+| Stage | Normalized WER |
 |---|---|
-| Base Whisper Medium (no fine-tuning) | ~35–45% |
-| After fine-tuning (POC, 5 hrs data)  | ~20–25% |
-| After fine-tuning (full, 10+ hrs)    | <20%     |
-| With initial_prompt + corrections    | <15%     |
+| Base Whisper Large-v3 (no fine-tuning) — **measured** | **16.76%** (57-clip eval) |
+| Fine-tuned (POC, 2.9 hrs, 120 steps) — **measured**   | **16.01%** (+0.75 pts) |
+| After fine-tuning (full, 5–10+ hrs) — target          | <13%     |
+| With initial_prompt + corrections — target            | <10%     |
+
+See [`SMOKE_TEST_REPORT.md`](SMOKE_TEST_REPORT.md) for the full POC run.
 
 ---
 
@@ -318,19 +340,20 @@ python src/data_prep.py \
 
 python src/dataset_builder.py
 
-# ── Upload to Modal ─────────────────────────────────────────────────
-modal volume put whisper-training-vol ./data/processed /data/processed
-modal volume put whisper-training-vol ./config /data/config
+# ── Upload to Modal (PowerShell on Windows; ROOT-RELATIVE remote paths) ─
+modal volume put whisper-training-vol ./data/processed/dataset /processed/dataset
+modal volume put whisper-training-vol ./config /config
 
 # ── Training ────────────────────────────────────────────────────────
 modal run modal_app.py::train                  # Streams logs live
 
 # ── Evaluation ──────────────────────────────────────────────────────
-modal run modal_app.py::evaluate               # Computes WER on test set
+modal run modal_app.py::evaluate --which base  # Baseline (base model) — do BEFORE train
+modal run modal_app.py::evaluate               # Both: base vs fine-tuned + delta
 
 # ── Download Model ──────────────────────────────────────────────────
 modal volume get whisper-training-vol \
-  /data/model/whisper-medium-urdu-final ./model/final
+  /model/whisper-urdu-final ./model/final
 
 # ── Convert to faster-whisper ───────────────────────────────────────
 ct2-transformers-converter \
@@ -343,21 +366,26 @@ ct2-transformers-converter \
 modal run modal_app.py::transcribe_batch
 
 # ── Push to HuggingFace Hub (do immediately after training) ─────────
-python scripts/download_model.py --push-to-hub your-org/whisper-medium-urdu
+python scripts/download_model.py --push-to-hub your-org/whisper-large-v3-urdu
 ```
 
 ---
 
 ## Key Dependencies
+> ⚠️ **Pin UPPER bounds.** Unbounded `>=` pulled transformers 5.x / torch 2.12 /
+> numpy 2.4 / jiwer 4.0, which break `Seq2SeqTrainer` (the `evaluation_strategy`
+> and `tokenizer=` args were renamed/removed in transformers 4.46+) and the
+> `forced_decoder_ids` generate path. The tested-working stack for the Modal image:
 ```
-transformers>=4.40.0
-datasets>=2.18.0
-evaluate>=0.4.0
-jiwer>=3.0.3
-torch>=2.2.0
-torchaudio>=2.2.0
-accelerate>=0.28.0
-peft>=0.10.0           # LoRA (Path B)
+transformers>=4.40.0,<4.46
+datasets>=2.18.0,<3.0.0   # >=3.0 requires torchcodec for Audio decoding
+evaluate>=0.4.0,<0.5
+jiwer>=3.0.3,<4.0
+torch>=2.2.0,<2.5
+torchaudio>=2.2.0,<2.5
+accelerate>=0.28.0,<1.0
+peft>=0.10.0,<0.14     # LoRA (Path B)
+numpy<2.0
 ctranslate2>=4.0.0     # faster-whisper conversion
 faster-whisper>=1.0.0  # Production inference
 whisperx>=3.1.0        # Timestamp alignment
@@ -371,9 +399,9 @@ pyyaml>=6.0
 ---
 
 ## POC Phases
-1. **Data Prep** — Manually transcribe 3–5 hrs, run data_prep.py + dataset_builder.py
-2. **Baseline** — Transcribe 50 test clips with base model, document WER (~35–45%)
-3. **Path B POC** — Fine-tune LoRA on 3 hrs, evaluate WER on same 50 clips
-4. **Iterate** — Expand to 5–7 hrs, re-train, target WER <25%
+1. **Data Prep** — Manually transcribe 3–5 hrs, run data_prep.py + dataset_builder.py ✅
+2. **Baseline** — Evaluate base model on held-out clips, document WER (measured: 16.76%) ✅
+3. **Path B POC** — Fine-tune LoRA, evaluate WER on same clips (measured: 16.01%) ✅ *(smoke test passed — see SMOKE_TEST_REPORT.md)*
+4. **Iterate** — Expand to 5–10 hrs (review remaining 13 episodes), re-train, add LoRA target modules
 5. **Timestamp validation** — Run WhisperX on sample clips, verify alignment quality
 6. **Production** — Convert to faster-whisper + WhisperX, batch transcribe all 4,000 videos
