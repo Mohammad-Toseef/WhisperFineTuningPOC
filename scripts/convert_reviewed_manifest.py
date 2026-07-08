@@ -165,6 +165,15 @@ def main() -> None:
         help="Root directory containing local batch folders (default: data/processed).",
     )
     parser.add_argument(
+        "--batch-folder",
+        default=None,
+        help=(
+            "Force a specific local batch folder (e.g. Batch1_EP23) instead of "
+            "auto-detecting by Jaccard. Use when multiple folders contain the same "
+            "audio and you want the canonical one."
+        ),
+    )
+    parser.add_argument(
         "--output",
         default=None,
         help=(
@@ -197,7 +206,24 @@ def main() -> None:
         (entry["episode_label"], entry["youtube_video_id"], entry["chunk_index"])
         for entry in reviewed
     }
-    batch_folder, local_lookup = find_matching_batch(reviewed_keys, processed_dir)
+    if args.batch_folder:
+        forced_manifest = processed_dir / args.batch_folder / "manifest.json"
+        if not forced_manifest.exists():
+            print(f"ERROR: --batch-folder manifest not found: {forced_manifest}", file=sys.stderr)
+            sys.exit(1)
+        batch_folder = args.batch_folder
+        local_lookup = parse_local_manifest(forced_manifest)
+        overlap = reviewed_keys & set(local_lookup.keys())
+        coverage = len(overlap) / len(reviewed_keys)
+        print(f"Forced local batch folder: '{batch_folder}' ({coverage:.0%} coverage)")
+        if coverage < 1.0:
+            print(
+                f"WARNING: {len(reviewed_keys) - len(overlap)} reviewed entries have no "
+                f"matching audio in '{batch_folder}' — reconstructed paths may not exist.",
+                file=sys.stderr,
+            )
+    else:
+        batch_folder, local_lookup = find_matching_batch(reviewed_keys, processed_dir)
 
     if args.output:
         output_path = Path(args.output)
