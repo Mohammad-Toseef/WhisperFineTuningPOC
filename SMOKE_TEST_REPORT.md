@@ -1,11 +1,11 @@
 # Whisper Large-v3 LoRA — Smoke Test Report
 
-**Date:** 2026-07-06
+**Date:** 2026-07-07
 **Platform:** Modal (workspace `mstechnologies`, env `main`)
 **Base model:** `openai/whisper-large-v3` (1.5B params)
 **Objective:** Validate the *entire* fine-tuning pipeline end-to-end — data → dataset →
 LoRA training → merge → baseline-vs-fine-tuned WER — on a small dataset (2.9 hrs)
-before committing to the full 23-episode run.
+before committing to the full 50-episode run.
 
 > **Bottom line:** ✅ Pipeline fully validated. Base WER **16.76%** → fine-tuned **16.01%**
 > normalized (**+0.75 points**). Modest but real improvement; small delta is expected given
