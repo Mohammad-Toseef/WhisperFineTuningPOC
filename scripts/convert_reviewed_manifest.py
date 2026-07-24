@@ -56,99 +56,94 @@ def parse_local_manifest(manifest_path: Path) -> dict[tuple, dict]:
     return lookup
 
 
-def find_matching_batch(
-    reviewed_keys: set[tuple],
+def _audio_exists(audio_path: str) -> bool:
+    """True if the (Windows-or-POSIX) audio_path resolves to a file on disk."""
+    return Path(audio_path.replace("\\", "/")).exists()
+
+
+def build_global_lookup(
     processed_dir: Path,
-) -> tuple[str, dict[tuple, dict]]:
+) -> tuple[dict[tuple, dict], dict[tuple, str]]:
     """
-    Find the local batch folder whose manifest covers exactly the same
-    (episode_label, youtube_video_id, chunk_index) tuples as the reviewed file.
-    Returns (batch_folder_name, lookup_dict).
+    Build a lookup across ALL local batch manifests, keyed by
+    (episode_label, youtube_video_id, chunk_index) -> entry.
+
+    A reviewed manifest that spans several batch folders (e.g. 49 episodes across
+    Batch1_EP23 = EP1-23 and Batch2_EP24_EP50 = EP24-50) resolves each clip from
+    whichever folder actually contains it — no single "best" folder is assumed.
+
+    On duplicate keys (same clip present in multiple folders), prefer an entry
+    whose audio file exists on disk; otherwise keep the first (folder-sorted) one.
+
+    Returns (lookup, source_folder) where source_folder maps key -> batch folder.
     """
-    candidates = []
+    lookup: dict[tuple, dict] = {}
+    source_folder: dict[tuple, str] = {}
+
     for manifest_path in sorted(processed_dir.glob("*/manifest.json")):
         batch_folder = manifest_path.parent.name
-        lookup = parse_local_manifest(manifest_path)
-        local_keys = set(lookup.keys())
+        for key, entry in parse_local_manifest(manifest_path).items():
+            if key in lookup:
+                existing_ok = _audio_exists(lookup[key]["audio_path"])
+                candidate_ok = _audio_exists(entry["audio_path"])
+                # Keep existing unless it's a dead path and the candidate is live.
+                if existing_ok or not candidate_ok:
+                    continue
+            lookup[key] = entry
+            source_folder[key] = batch_folder
 
-        overlap = reviewed_keys & local_keys
-        if not overlap:
-            continue
-
-        # Jaccard similarity: penalises superset matches (local has extra chunks)
-        jaccard = len(overlap) / len(reviewed_keys | local_keys)
-        candidates.append((jaccard, batch_folder, lookup))
-
-    if not candidates:
-        print("ERROR: No local manifest shares any entries with the reviewed manifest.", file=sys.stderr)
+    if not lookup:
+        print(f"ERROR: No local */manifest.json found under {processed_dir}", file=sys.stderr)
         sys.exit(1)
 
-    candidates.sort(key=lambda c: c[0], reverse=True)
-    best_jaccard, best_folder, best_lookup = candidates[0]
-    overlap_count = len(reviewed_keys & set(best_lookup.keys()))
-    coverage = overlap_count / len(reviewed_keys)
+    return lookup, source_folder
 
-    print(f"Matched local batch folder: '{best_folder}' ({coverage:.0%} coverage, Jaccard={best_jaccard:.2f})")
 
-    if coverage < 1.0:
-        missing = len(reviewed_keys) - overlap_count
-        print(
-            f"WARNING: {missing} reviewed entries have no matching local audio file. "
-            "They will use a reconstructed path.",
-            file=sys.stderr,
-        )
+def _ep_num(episode_label: str) -> int:
+    m = re.match(r"EP(\d+)", episode_label)
+    return int(m.group(1)) if m else 0
 
-    return best_folder, best_lookup
+
+def report_coverage(
+    reviewed: list[dict],
+    lookup: dict[tuple, dict],
+    source_folder: dict[tuple, str] | None,
+) -> int:
+    """Print per-episode matched/total coverage. Returns total unmatched count."""
+    from collections import defaultdict
+
+    matched_by_ep: dict[str, int] = defaultdict(int)
+    total_by_ep: dict[str, int] = defaultdict(int)
+    folders_used: set[str] = set()
+
+    for entry in reviewed:
+        ep = entry["episode_label"]
+        key = (ep, entry["youtube_video_id"], entry["chunk_index"])
+        total_by_ep[ep] += 1
+        if key in lookup:
+            matched_by_ep[ep] += 1
+            if source_folder is not None:
+                folders_used.add(source_folder[key])
+
+    print("Coverage by episode:")
+    n_missing = 0
+    for ep in sorted(total_by_ep, key=_ep_num):
+        matched, total = matched_by_ep[ep], total_by_ep[ep]
+        missing = total - matched
+        n_missing += missing
+        flag = "" if missing == 0 else f"   <-- {missing} MISSING"
+        print(f"  {ep:<6} {matched}/{total}{flag}")
+    print(f"  {'TOTAL':<6} {sum(matched_by_ep.values())}/{sum(total_by_ep.values())} "
+          f"across {len(total_by_ep)} episodes")
+    if source_folder is not None and folders_used:
+        print(f"  Resolved from folders: {sorted(folders_used)}")
+    return n_missing
 
 
 def build_audio_path(batch_folder: str, episode_label: str, youtube_video_id: str, chunk_index: int) -> str:
     ep_ytid = f"{episode_label}_{youtube_video_id}"
     filename = f"{ep_ytid}_{chunk_index:03d}.wav"
     return f"data\\processed\\{batch_folder}\\audio\\{ep_ytid}\\{filename}"
-
-
-def convert(reviewed_path: Path, processed_dir: Path, output_path: Path) -> None:
-    with open(reviewed_path, encoding="utf-8") as f:
-        reviewed = json.load(f)
-
-    reviewed_keys = {
-        (entry["episode_label"], entry["youtube_video_id"], entry["chunk_index"])
-        for entry in reviewed
-    }
-
-    batch_folder, local_lookup = find_matching_batch(reviewed_keys, processed_dir)
-
-    output_entries = []
-    unmatched = 0
-
-    for entry in reviewed:
-        ep = entry["episode_label"]
-        ytid = entry["youtube_video_id"]
-        idx = entry["chunk_index"]
-        key = (ep, ytid, idx)
-
-        local_entry = local_lookup.get(key)
-        if local_entry:
-            audio_path = local_entry["audio_path"]
-        else:
-            # Reconstruct path from identifiers — may not exist on disk
-            audio_path = build_audio_path(batch_folder, ep, ytid, idx)
-            unmatched += 1
-
-        output_entries.append({
-            "audio_path": audio_path,
-            "transcript": entry["transcript"],
-            "duration": entry["duration"],
-            "language": entry["language"],
-        })
-
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(output_path, "w", encoding="utf-8") as f:
-        json.dump(output_entries, f, ensure_ascii=False, indent=2)
-
-    print(f"Written {len(output_entries)} entries -> {output_path}")
-    if unmatched:
-        print(f"  ({unmatched} paths reconstructed — verify these files exist on disk)")
 
 
 def main() -> None:
@@ -186,6 +181,15 @@ def main() -> None:
         default="manifest_reviewed.json",
         help="Output filename within the matched batch folder (default: manifest_reviewed.json).",
     )
+    parser.add_argument(
+        "--allow-reconstruct",
+        action="store_true",
+        help=(
+            "Do not fail on unmatched clips; reconstruct their audio_path from "
+            "identifiers instead (paths may not exist on disk). Only meaningful "
+            "with --batch-folder. Default: unmatched clips are a hard error."
+        ),
+    )
     args = parser.parse_args()
 
     reviewed_path = Path(args.reviewed_manifest)
@@ -202,10 +206,11 @@ def main() -> None:
     with open(reviewed_path, encoding="utf-8") as f:
         reviewed = json.load(f)
 
-    reviewed_keys = {
-        (entry["episode_label"], entry["youtube_video_id"], entry["chunk_index"])
-        for entry in reviewed
-    }
+    # ── Resolve the local audio lookup ──────────────────────────────
+    #  --batch-folder   → single forced folder (legacy behaviour)
+    #  default          → GLOBAL lookup across every data/processed/*/manifest.json
+    #                     so a manifest spanning multiple batch folders (e.g. 49
+    #                     episodes across Batch1_EP23 + Batch2_EP24_EP50) resolves.
     if args.batch_folder:
         forced_manifest = processed_dir / args.batch_folder / "manifest.json"
         if not forced_manifest.exists():
@@ -213,24 +218,40 @@ def main() -> None:
             sys.exit(1)
         batch_folder = args.batch_folder
         local_lookup = parse_local_manifest(forced_manifest)
-        overlap = reviewed_keys & set(local_lookup.keys())
-        coverage = len(overlap) / len(reviewed_keys)
-        print(f"Forced local batch folder: '{batch_folder}' ({coverage:.0%} coverage)")
-        if coverage < 1.0:
-            print(
-                f"WARNING: {len(reviewed_keys) - len(overlap)} reviewed entries have no "
-                f"matching audio in '{batch_folder}' — reconstructed paths may not exist.",
-                file=sys.stderr,
-            )
+        source_folder = None            # single-folder mode
+        print(f"Using forced local batch folder: '{batch_folder}'")
     else:
-        batch_folder, local_lookup = find_matching_batch(reviewed_keys, processed_dir)
+        batch_folder = None
+        local_lookup, source_folder = build_global_lookup(processed_dir)
+        print(f"Built global lookup: {len(local_lookup)} local clips across all batch folders")
 
+    # ── Coverage report (per episode) ───────────────────────────────
+    n_missing = report_coverage(reviewed, local_lookup, source_folder)
+    if n_missing and not args.allow_reconstruct:
+        print(
+            f"\nERROR: {n_missing} reviewed clips have no matching local audio. "
+            "Fix the source audio / batch folders, or pass --allow-reconstruct "
+            "to write reconstructed paths anyway (requires --batch-folder).",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    if n_missing and args.allow_reconstruct and batch_folder is None:
+        print(
+            "\nERROR: --allow-reconstruct needs --batch-folder to know which folder "
+            "to reconstruct the missing paths under.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    # ── Output path ─────────────────────────────────────────────────
     if args.output:
         output_path = Path(args.output)
-    else:
+    elif batch_folder is not None:
         output_path = processed_dir / batch_folder / args.output_name
+    else:
+        output_path = processed_dir / args.output_name
 
-    # Re-run conversion using already-resolved batch info (avoid double scan)
+    # ── Build converted manifest ────────────────────────────────────
     output_entries = []
     unmatched = 0
     for entry in reviewed:
@@ -243,6 +264,7 @@ def main() -> None:
         if local_entry:
             audio_path = local_entry["audio_path"]
         else:
+            # Only reachable with --allow-reconstruct + --batch-folder.
             audio_path = build_audio_path(batch_folder, ep, ytid, idx)
             unmatched += 1
 
@@ -257,7 +279,7 @@ def main() -> None:
     with open(output_path, "w", encoding="utf-8") as f:
         json.dump(output_entries, f, ensure_ascii=False, indent=2)
 
-    print(f"Written {len(output_entries)} entries -> {output_path}")
+    print(f"\nWritten {len(output_entries)} entries -> {output_path}")
     if unmatched:
         print(f"  ({unmatched} paths reconstructed — verify these files exist on disk)")
 

@@ -1,0 +1,10 @@
+{
+  "_comment": "Layer-3 post-processing corrections (CLAUDE.md 'Handling Unknown Words'). Maps a recurring wrong transcription -> the correct three-script output. Keys are matched case-insensitively as whole substrings after inference. EXPAND from real fine-tuned outputs in full_audio_samples/compare_transcripts/ and the first production batch. English stays English, Urdu in Nastaliq, Arabic in Arabic.",
+  "corrections": {
+    "eastern financing": "Istisna financing",
+    "what's up karo": "WhatsApp کرو",
+    "the kaful": "Takaful",
+    "agera": "Ijara",
+    "mezan bank": "Meezan Bank"
+  }
+}

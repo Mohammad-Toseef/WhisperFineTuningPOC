@@ -10,9 +10,11 @@ Per the CLAUDE.md transcription convention:
 Creates manifest_normalized_v2.json. Does NOT overwrite the original.
 """
 
+import argparse
 import json
 from pathlib import Path
 
+# Defaults preserved for backward compatibility; override with --input/--output.
 INPUT_PATH  = Path("data/processed/Batch1_EP23/manifest_normalized.json")
 OUTPUT_PATH = Path("data/processed/Batch1_EP23/manifest_normalized_v2.json")
 
@@ -199,10 +201,20 @@ def apply_replacements(text: str) -> str:
 
 
 def main() -> None:
-    if not INPUT_PATH.exists():
-        raise FileNotFoundError(f"Input not found: {INPUT_PATH}")
+    parser = argparse.ArgumentParser(
+        description="Rewrite English loanwords mis-spelled in Nastaliq back to English script."
+    )
+    parser.add_argument("--input", default=str(INPUT_PATH),
+                        help=f"Input manifest JSON (default: {INPUT_PATH}).")
+    parser.add_argument("--output", default=str(OUTPUT_PATH),
+                        help=f"Output manifest JSON (default: {OUTPUT_PATH}).")
+    args = parser.parse_args()
 
-    with open(INPUT_PATH, "r", encoding="utf-8") as f:
+    input_path, output_path = Path(args.input), Path(args.output)
+    if not input_path.exists():
+        raise FileNotFoundError(f"Input not found: {input_path}")
+
+    with open(input_path, "r", encoding="utf-8") as f:
         manifest = json.load(f)
 
     changed = 0
@@ -213,11 +225,12 @@ def main() -> None:
             entry["transcript"] = fixed
             changed += 1
 
-    with open(OUTPUT_PATH, "w", encoding="utf-8") as f:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(output_path, "w", encoding="utf-8") as f:
         json.dump(manifest, f, ensure_ascii=False, indent=2)
 
-    print(f"Input:     {INPUT_PATH}  ({len(manifest)} entries)")
-    print(f"Output:    {OUTPUT_PATH}")
+    print(f"Input:     {input_path}  ({len(manifest)} entries)")
+    print(f"Output:    {output_path}")
     print(f"Changed:   {changed} transcripts")
     print(f"Unchanged: {len(manifest) - changed} transcripts")
 

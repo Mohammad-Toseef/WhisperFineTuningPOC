@@ -239,6 +239,7 @@ def evaluate(which: str = "both"):
       modal run modal_app.py::evaluate                 # both
       modal run modal_app.py::evaluate --which base    # baseline only
     """
+    import os
     import re
     import json
     import yaml
@@ -259,6 +260,27 @@ def evaluate(which: str = "both"):
     eval_ds = dataset["eval"]
     references = [s for s in eval_ds["sentence"]]
     print(f"📏 Evaluating on {len(eval_ds)} held-out clips.")
+
+    # ── Per-bucket eval subsets (from dataset_builder's sidecar) ────
+    # Lets us report WER separately for code-switching / spiritual-term clips,
+    # where fine-tuning's benefit concentrates but aggregate WER hides it.
+    BUCKETS = ["nastaliq_only", "code_switch", "spiritual_term"]
+    bucket_indices: dict[str, list[int]] = {}
+    sidecar = os.path.join(cfg["data"]["dataset_path"], "eval_buckets.json")
+    if os.path.exists(sidecar):
+        with open(sidecar, encoding="utf-8") as f:
+            bmeta = json.load(f)
+        if len(bmeta) != len(references):
+            print(f"⚠️  eval_buckets.json has {len(bmeta)} rows != {len(references)} eval "
+                  "clips — skipping per-bucket WER (rebuild the dataset).")
+        elif any(bmeta[i].get("sentence") != references[i] for i in range(len(references))):
+            print("⚠️  eval_buckets.json is misaligned with the eval split — skipping per-bucket WER.")
+        else:
+            for b in BUCKETS:
+                bucket_indices[b] = [i for i, m in enumerate(bmeta) if b in m["buckets"]]
+            print("   buckets: " + ", ".join(f"{b}={len(bucket_indices[b])}" for b in BUCKETS))
+    else:
+        print("ℹ️  No eval_buckets.json found — reporting overall WER only.")
 
     wer_metric = hf_evaluate.load("wer")
 
@@ -306,12 +328,24 @@ def evaluate(which: str = "both"):
             predictions=[normalize(p) for p in preds],
             references=[normalize(r) for r in references],
         )
+        # Per-bucket normalized WER over the sidecar subsets.
+        buckets_wer = {}
+        for b, idxs in bucket_indices.items():
+            if not idxs:
+                continue
+            buckets_wer[b] = {
+                "n": len(idxs),
+                "norm_wer": 100 * wer_metric.compute(
+                    predictions=[normalize(preds[i]) for i in idxs],
+                    references=[normalize(references[i]) for i in idxs],
+                ),
+            }
         del model
         torch.cuda.empty_cache()
         print(f"   → {label}: raw WER {raw_wer:.2f}% | normalized WER {norm_wer:.2f}%")
-        return {"label": label, "raw_wer": raw_wer, "norm_wer": norm_wer, "predictions": preds}
+        return {"label": label, "raw_wer": raw_wer, "norm_wer": norm_wer,
+                "buckets": buckets_wer, "predictions": preds}
 
-    import os
     results = {}
     if which in ("base", "both"):
         results["base"] = run_model(base_name, f"BASE ({base_name})")
@@ -334,6 +368,25 @@ def evaluate(which: str = "both"):
         print("-" * 60)
         print(f"  Improvement (normalized WER):   {delta:+.2f} points")
     print("=" * 60)
+
+    # ── Per-bucket breakdown (this is where domain-term gains show up) ──
+    if bucket_indices:
+        print("\n  PER-BUCKET normalized WER")
+        print(f"  {'bucket':<16}{'n':>6}{'base':>10}{'finetuned':>12}{'delta':>9}")
+        print("-" * 53)
+        for b in BUCKETS:
+            base_b = results.get("base", {}).get("buckets", {}).get(b)
+            ft_b = results.get("finetuned", {}).get("buckets", {}).get(b)
+            n = (base_b or ft_b or {}).get("n")
+            if n is None:
+                continue
+            base_w = base_b["norm_wer"] if base_b else None
+            ft_w = ft_b["norm_wer"] if ft_b else None
+            base_s = f"{base_w:.2f}" if base_w is not None else "-"
+            ft_s = f"{ft_w:.2f}" if ft_w is not None else "-"
+            delta_s = f"{base_w - ft_w:+.2f}" if (base_w is not None and ft_w is not None) else "-"
+            print(f"  {b:<16}{n:>6}{base_s:>10}{ft_s:>12}{delta_s:>9}")
+        print("=" * 60)
 
     # Persist results to the volume for later reference
     os.makedirs(f"{VOLUME_PATH}/logs", exist_ok=True)
