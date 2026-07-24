@@ -6,7 +6,11 @@ model:
 lora:
   r: 32
   lora_alpha: 64
-  target_modules: ["q_proj", "v_proj"]
+  # Tier 2 (full run): attention (q/k/v/out) + MLP (fc1/fc2). The MLP targets are
+  # the lexical/vocabulary lever needed to learn domain/spiritual terms and the
+  # izafat ( ِ ) mark; attention alone (q/v, the smoke-test config) only adapts
+  # accent/pacing. ~3-4% trainable vs 1.0% at Tier 1.
+  target_modules: ["q_proj", "k_proj", "v_proj", "out_proj", "fc1", "fc2"]
   lora_dropout: 0.05
   # task_type MUST be null for Whisper. Setting SEQ_2_SEQ_LM makes PEFT feed
   # `input_ids` to the base model, but Whisper.forward() takes `input_features`.
@@ -23,15 +27,20 @@ training:
   per_device_eval_batch_size: 4
   gradient_accumulation_steps: 4   # Effective batch = 32
   learning_rate: 1.0e-5
-  warmup_steps: 20
-  # POC smoke test: 535 clips ~= 15 steps/epoch @ eff-batch 32.
-  # 120 steps ~= 8 epochs. Raise for the real 23-episode run.
-  max_steps: 120
+  warmup_steps: 57   # ~10% of max_steps (49-ep run)
+  # Step-based (no num_train_epochs). RECOMPUTE for the 49-episode run once the
+  # dataset_builder prints the train-clip count:
+  #   steps_per_epoch = ceil(n_train_clips / 32)   # eff-batch = 8 * 4
+  #   max_steps       = steps_per_epoch * 8..10     # target 8-10 epochs
+  # Also scale warmup_steps (~10% of max_steps) and eval/save_steps below.
+  # Smoke test was 535 clips -> ~15 steps/epoch -> 120 steps (~8 epochs).
+  # 49-ep run (2026-07-25): 2011 train clips -> ceil(2011/32)=63 steps/epoch -> 567 (~9 epochs).
+  max_steps: 567
   gradient_checkpointing: true
   fp16: true
   evaluation_strategy: "steps"
-  eval_steps: 30
-  save_steps: 30
+  eval_steps: 63   # once per epoch (9 evals over the run)
+  save_steps: 63
   save_total_limit: 3
   load_best_model_at_end: true
   metric_for_best_model: "wer"
