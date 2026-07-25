@@ -75,10 +75,10 @@ def transcribe_with_model(audio_bytes: bytes, suffix: str, model_path: str) -> s
 @app.local_entrypoint()
 def main():
     audio_dir = Path("full_audio_samples")
-    out_dir = audio_dir / "compare_transcripts"
-    out_dir.mkdir(exist_ok=True)
+    out_dir = audio_dir / "compare_transcripts" / "Full Fine Tuned"
+    out_dir.mkdir(parents=True, exist_ok=True)
 
-    files = ["EP19_xNjY-mZlyEU.mp3", "EP2_q1Q6B2JrY58.mp3"]
+    files = ["Yahoodi ya Sahyooni Farq Samajhiye!  Younus AlGoha_FtFT8B41H7U.mp3"]
 
     for fname in files:
         path = audio_dir / fname
