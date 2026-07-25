@@ -33,3 +33,8 @@ logs/
 .idea/
 .DS_Store
 Thumbs.db
+
+full_audio_samples/*.mp3
+full_audio_samples/compare_transcripts/*
+*.xlsx
+Manifest_Analysis_Report.docx
