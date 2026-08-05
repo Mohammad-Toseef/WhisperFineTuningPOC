@@ -37,4 +37,9 @@ Thumbs.db
 full_audio_samples/*.mp3
 full_audio_samples/compare_transcripts/*
 *.xlsx
+# ...except these two: hand-verified pipeline INPUTS, not derived output.
+# episode_skip_start_v2.xlsx is required by src/srt_pipeline/batch_clean_intro_music.py;
+# without it the music-trimmed audio the dataset is built from is unreproducible.
+!config/episode_skip_start_v2.xlsx
+!Whisper_Second_Round_Training_list.xlsx
 Manifest_Analysis_Report.docx
