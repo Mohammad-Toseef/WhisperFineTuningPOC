@@ -38,6 +38,7 @@ steps involve people, so they are outside this driver.
 import argparse
 import csv
 import json
+import os
 import re
 import subprocess
 import sys
@@ -67,12 +68,27 @@ def modal_executable() -> str:
     return "modal"
 
 
+def child_environment() -> dict:
+    """Force UTF-8 on child stdio.
+
+    Every stage prints non-ASCII -- Urdu transcript previews, ✓/⚠ markers, and Modal's own
+    CLI output. On Windows a child's stdout defaults to the ANSI codepage (cp1252), which
+    cannot encode any of it, so the stage dies with 'charmap' codec can't encode character
+    '\\u2713'. Observed for real: stage 3+4 crashed on Modal printing a single ✓ *after*
+    the GPU work had been dispatched, turning a cosmetic issue into a failed stage.
+    """
+    environment = dict(os.environ)
+    environment["PYTHONIOENCODING"] = "utf-8"
+    environment["PYTHONUTF8"] = "1"
+    return environment
+
+
 def run(command: list[str], dry_run: bool, cwd: Path = REPO) -> int:
     printable = " ".join(f'"{c}"' if " " in c else c for c in command)
     print(f"\n$ {printable}", flush=True)
     if dry_run:
         return 0
-    return subprocess.run(command, cwd=str(cwd)).returncode
+    return subprocess.run(command, cwd=str(cwd), env=child_environment()).returncode
 
 
 # ── status ────────────────────────────────────────────────────────────────────────
@@ -233,8 +249,15 @@ def do_run(args) -> int:
              + (["--cookies", args.cookies] if args.cookies else []),
         "2": [sys.executable, "src/srt_pipeline/batch_clean_intro_music.py",
               "--batch", args.batch, "--only", only],
-        # modal run passes entrypoint args after the function reference
-        "34": [modal_executable(), "run", "modal_align.py::transcribe_align",
+        # modal run passes entrypoint args after the function reference.
+        #
+        # --detach protects a long GPU stage from a local network drop. It does NOT make
+        # the command return early -- the local entrypoint still runs to completion here,
+        # so stages 5-6 cannot start before the SRTs exist. What it changes is the
+        # disconnect case: without it Modal stops the app and the GPU work is lost;
+        # with it the container runs on and commits its result to the volume, and the
+        # next run recovers that for free (transcribe_align checks the volume first).
+        "34": [modal_executable(), "run", "--detach", "modal_align.py::transcribe_align",
                "--batch", args.batch, "--only", only]
               + (["--model-path", args.model_path] if args.model_path else []),
         # Stages 5-6 are batch-wide on purpose: both are incremental, and running them over

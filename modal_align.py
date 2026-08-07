@@ -15,6 +15,12 @@ re-upload every file and pay a second cold start. The fine-tuned Whisper runs ON
 the aligner is a separate, much smaller wav2vec2 CTC model that locates known words
 rather than transcribing.
 
+Results are durable independent of the client: transcribe_and_align commits each .srt and
+.txt to the volume under srt_results/<batch>/ BEFORE returning, and transcribe_align checks
+the volume before dispatching. So a run interrupted by a network drop is recovered for free
+on the next run instead of paying for the same GPU minutes twice. Use --detach so the
+container survives the disconnect long enough to commit.
+
 Usage:
     # round-1 style, verified transcript
     modal run modal_align.py --audio-path EP3.mp3 --text-path EP3.txt --out-path EP3.srt
@@ -25,6 +31,9 @@ Usage:
     # a later batch, with a later model
     modal run --detach modal_align.py::transcribe_align --batch batch4 \
         --model-path /data/model/whisper-urdu-round2
+
+    # pull results off the volume without starting a run (recovery / inspection)
+    modal run modal_align.py::fetch_results --batch batch3
 """
 
 import sys
@@ -42,6 +51,24 @@ app = modal.App("srt-forced-alignment")
 volume = modal.Volume.from_name("whisper-training-vol", create_if_missing=False)
 VOLUME_PATH = "/data"
 FINAL_MODEL_PATH = f"{VOLUME_PATH}/model/whisper-urdu-final"
+
+# Where the GPU stage parks its results, volume-relative (so both the container path and
+# the client-side read path derive from one constant).
+#
+# Why results go to the volume at all: transcribe_and_align RETURNS the srt/text to the
+# caller, and the local entrypoint is what writes them to disk. That makes the local
+# client a single point of failure for a 20+ minute GPU job -- drop the connection and
+# the work completes (or is killed) with nothing to show for it, and the next run
+# recomputes from scratch because idempotency keys off the local .srt existing.
+# Committing to the volume first makes the output durable server-side, independent of
+# the client, so a re-run FETCHES instead of paying for the GPU twice.
+RESULTS_SUBDIR = "srt_results"
+
+
+def results_dir_for(batch: str) -> tuple[str, str]:
+    """(container absolute path, volume-relative path) for a batch's results."""
+    relative = f"{RESULTS_SUBDIR}/{batch}"
+    return f"{VOLUME_PATH}/{relative}", relative
 
 # Upper bounds are load-bearing: unbounded installs pulled transformers 5.x / torch 2.12
 # / numpy 2.4 during the round-1 training run and broke the generate path. whisperx is
@@ -96,11 +123,17 @@ def transcribe_and_align(
     language: str = "ur",
     align_lang: str = "ur",
     model_path: str = FINAL_MODEL_PATH,
+    out_stem: str = "",
+    results_dir: str = "",
 ) -> dict:
     """Stage 3+4 fused: fine-tuned Whisper transcribes, wav2vec2 CTC re-times.
 
     Returns {"srt": str, "segments": int, "words": int, "text": str, "error": str|None}
     so a failure on one episode is reported rather than killing the whole batch.
+
+    When `out_stem` and `results_dir` are given, the srt and text are ALSO committed to the
+    volume before returning. The return value stays authoritative for a normal run; the
+    volume copy is what survives a client disconnect (see RESULTS_SUBDIR).
     """
     import os
     import tempfile
@@ -156,12 +189,27 @@ def transcribe_and_align(
         srt_text = core.align_segments_to_srt(
             audio, segments, align_lang, device="cuda", log=print,
         )
+        transcript_text = "\n".join(s["text"] for s in segments)
+
+        # Persist to the volume BEFORE returning, so the result outlives the client.
+        # Only on success: an empty SRT must not create a file, or the fetch-first check
+        # would treat a failed episode as done and never retry it.
+        if out_stem and results_dir and srt_text.strip():
+            from pathlib import Path as _Path
+
+            target = _Path(results_dir)
+            target.mkdir(parents=True, exist_ok=True)
+            (target / f"{out_stem}.srt").write_text(srt_text, encoding="utf-8")
+            (target / f"{out_stem}.txt").write_text(transcript_text, encoding="utf-8")
+            volume.commit()  # without this the writes stay container-local and are lost
+            print(f"committed {out_stem}.srt + .txt to {results_dir}")
+
         return {
             "srt": srt_text,
             "segments": len(segments),
             # Count blocks, not "\n\n" separators -- N cues yield N-1 of those.
             "cues": len([b for b in srt_text.strip().split("\n\n") if b.strip()]),
-            "text": "\n".join(s["text"] for s in segments),
+            "text": transcript_text,
             "error": None,
         }
     except Exception as exc:
@@ -172,6 +220,76 @@ def transcribe_and_align(
                 "error": f"{type(exc).__name__}: {exc}"}
     finally:
         os.unlink(audio_path)
+
+
+def volume_result_stems(relative_dir: str) -> set[str]:
+    """Stems having a committed .srt on the volume. Empty set if nothing is there yet.
+
+    No volume.reload() here: that is container-only (it raises "can only be called from
+    within a running function" on the client), and it is not needed -- a client-side
+    listdir queries the volume's current state directly. Only NotFoundError is caught,
+    and only because an absent directory is the normal first-run state for a batch.
+    Catching broadly here hid exactly this bug: reload()'s RuntimeError was swallowed and
+    the function returned an empty set unconditionally, silently disabling fetch-first.
+    """
+    try:
+        return {
+            Path(entry.path).stem
+            for entry in volume.listdir(relative_dir)
+            if entry.path.endswith(".srt")
+        }
+    except modal.exception.NotFoundError:
+        return set()
+
+
+def read_volume_text(relative_path: str) -> str:
+    return b"".join(volume.read_file(relative_path)).decode("utf-8")
+
+
+def save_result(srt_text: str, transcript_text: str, srt_file: Path, text_dir: Path) -> None:
+    srt_file.write_text(srt_text, encoding="utf-8")
+    # Keep the model's pre-alignment text. It costs nothing -- a string join over the same
+    # single transcription pass -- and it is the ONLY reference against which alignment
+    # word-loss is measurable: an early bug silently dropped 5% of the words while every
+    # structural check on the SRT still passed.
+    # UNREVIEWED machine output: never feed it anywhere that expects verified text.
+    (text_dir / f"{srt_file.stem}.txt").write_text(transcript_text, encoding="utf-8")
+
+
+@app.local_entrypoint()
+def fetch_results(batch: str = "batch3", out_dir: str = "", asr_text_dir: str = ""):
+    """Pull GPU results off the volume into the local batch directories.
+
+    The recovery path after a disconnected run: the container already committed its work,
+    so this costs no GPU. transcribe_align does this automatically before dispatching, so
+    reach for this only to inspect or restore results without starting a run.
+    """
+    from batch_paths import BatchPaths
+
+    paths = BatchPaths(batch)
+    out_path_dir = Path(out_dir) if out_dir else paths.srt_dir
+    text_path_dir = Path(asr_text_dir) if asr_text_dir else paths.transcript_dir
+    out_path_dir.mkdir(parents=True, exist_ok=True)
+    text_path_dir.mkdir(parents=True, exist_ok=True)
+
+    _, relative = results_dir_for(batch)
+    stems = volume_result_stems(relative)
+    if not stems:
+        print(f"No results on the volume at {relative}/")
+        return
+
+    fetched, present = 0, 0
+    for stem in sorted(stems):
+        srt_file = out_path_dir / f"{stem}.srt"
+        if srt_file.exists():
+            present += 1
+            continue
+        save_result(read_volume_text(f"{relative}/{stem}.srt"),
+                    read_volume_text(f"{relative}/{stem}.txt"),
+                    srt_file, text_path_dir)
+        print(f"  fetched {stem}")
+        fetched += 1
+    print(f"\nFetched {fetched} | already local {present} | on volume {len(stems)}")
 
 
 @app.local_entrypoint()
@@ -239,13 +357,35 @@ def transcribe_align(
           f"|  not trimmed yet {len(missing)}")
     if missing:
         print(f"   not trimmed: {', '.join(missing[:12])}{' ...' if len(missing) > 12 else ''}")
+
+    # Fetch-first: a previous run may have finished on the GPU and committed its results
+    # while the client was gone (network drop, Ctrl-C, the cp1252 crash). Recovering those
+    # is free; recomputing them is not.
+    container_results, relative_results = results_dir_for(batch)
+    if pending:
+        on_volume = volume_result_stems(relative_results)
+        recovered = []
+        for entry in list(pending):
+            row, _, srt_file = entry
+            if srt_file.stem not in on_volume:
+                continue
+            save_result(read_volume_text(f"{relative_results}/{srt_file.stem}.srt"),
+                        read_volume_text(f"{relative_results}/{srt_file.stem}.txt"),
+                        srt_file, text_path_dir)
+            recovered.append(row["label"])
+            pending.remove(entry)
+        if recovered:
+            print(f"\nRecovered {len(recovered)} result(s) from the volume — no GPU needed: "
+                  f"{', '.join(recovered)}")
+
     if not pending:
         print("Nothing to do.")
         return
 
     call_args = [
-        (audio_file.read_bytes(), audio_file.suffix, language, align_lang, model_path)
-        for _, audio_file, _ in pending
+        (audio_file.read_bytes(), audio_file.suffix, language, align_lang, model_path,
+         srt_file.stem, container_results)
+        for _, audio_file, srt_file in pending
     ]
     print(f"\nDispatching {len(call_args)} episode(s) to Modal using {model_path}...")
 
@@ -260,13 +400,7 @@ def transcribe_align(
             print(f"  {label}: FAILED — produced an empty SRT")
             failures.append(label)
             continue
-        srt_file.write_text(result["srt"], encoding="utf-8")
-        # Also keep the model's pre-alignment text. It costs nothing -- a string join over
-        # the same single transcription pass -- and it is the ONLY reference against which
-        # alignment word-loss is measurable: an early bug silently dropped 5% of the words
-        # while every structural check on the SRT still passed.
-        # UNREVIEWED machine output: never feed it anywhere that expects verified text.
-        (text_path_dir / f"{srt_file.stem}.txt").write_text(result["text"], encoding="utf-8")
+        save_result(result["srt"], result["text"], srt_file, text_path_dir)
         print(f"  {label}: {result['segments']} segments -> {result['cues']} cues -> {srt_file.name}")
 
     print(f"\nDone. Wrote {len(pending) - len(failures)} SRT(s) to {out_path_dir}/")
