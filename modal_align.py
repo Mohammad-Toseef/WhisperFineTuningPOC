@@ -65,6 +65,11 @@ FINAL_MODEL_PATH = f"{VOLUME_PATH}/model/whisper-urdu-final"
 # the client, so a re-run FETCHES instead of paying for the GPU twice.
 RESULTS_SUBDIR = "srt_results"
 
+# The alignment language the image PRE-CACHES the wav2vec2 aligner for. Every entrypoint
+# defaults --align-lang to this; passing a different one still works, it just pays the
+# ~2.5 GB download at run time instead of at build time.
+DEFAULT_ALIGN_LANG = "ur"
+
 
 def results_dir_for(batch: str, windows: str = "vad") -> tuple[str, str]:
     """(container absolute path, volume-relative path) for a batch's results.
@@ -94,6 +99,25 @@ image = (
         "soundfile>=0.12.1",
         "numpy<2.0",
     ])
+    # Bake the wav2vec2 aligner into the image. Measured on a cold container: it pulls
+    # 2,524 MB from HuggingFace, EVERY cold start, on every one of the 93 remaining
+    # episodes. Baking it makes that a one-time build cost served from Modal's own registry
+    # instead of a repeated HF download that is also rate-limitable.
+    #
+    # The VAD model is deliberately NOT here: it ships INSIDE the whisperx package
+    # (whisperx/assets/pytorch_model.bin, 17.7 MB) and downloads nothing. Measured, not
+    # assumed -- loading it added 0 MB to the cache.
+    #
+    # device="cpu" because image builds have no GPU; only the weights matter, and they land
+    # in the default HF cache (/root/.cache/huggingface) which persists in the image layer.
+    #
+    # Placed BEFORE add_local_python_source on purpose: layers after a changed one are
+    # rebuilt, so putting this last would re-download 2.5 GB every time align_to_srt.py is
+    # edited -- which is the file most likely to change.
+    .run_commands(
+        'python -c "import whisperx; '
+        f'whisperx.load_align_model(language_code=\'{DEFAULT_ALIGN_LANG}\', device=\'cpu\')"'
+    )
     .add_local_python_source("align_to_srt")
 )
 
@@ -272,7 +296,7 @@ def transcribe_and_align(
     audio_bytes: bytes,
     suffix: str,
     language: str = "ur",
-    align_lang: str = "ur",
+    align_lang: str = DEFAULT_ALIGN_LANG,
     model_path: str = FINAL_MODEL_PATH,
     out_stem: str = "",
     results_dir: str = "",
@@ -379,7 +403,7 @@ def transcribe_and_align(
     volumes={VOLUME_PATH: volume},
 )
 def realign(audio_bytes: bytes, suffix: str, transcript_text: str, vad_payload: str,
-            align_lang: str = "ur") -> dict:
+            align_lang: str = DEFAULT_ALIGN_LANG) -> dict:
     """Stage 4 ALONE: re-time an existing transcript. No Whisper pass, no new text.
 
     Exists because the alignment code changed but the transcription did not. Re-running the
@@ -547,7 +571,7 @@ def realign_batch(
     out_dir: str = "",
     asr_text_dir: str = "",
     vad_dir: str = "",
-    align_lang: str = "ur",
+    align_lang: str = DEFAULT_ALIGN_LANG,
     backup_dir: str = "",
 ):
     """Re-align episodes that already have a transcript, WITHOUT re-transcribing.
@@ -642,7 +666,7 @@ def transcribe_align(
     only: str = "",
     limit: int = 0,
     language: str = "ur",
-    align_lang: str = "ur",
+    align_lang: str = DEFAULT_ALIGN_LANG,
     model_path: str = FINAL_MODEL_PATH,
     windows: str = "vad",
     batch_size: int = 8,
@@ -772,7 +796,7 @@ def transcribe_align(
 
 
 @app.local_entrypoint()
-def main(audio_path: str, text_path: str, out_path: str, asr_model: str = "large-v3", asr_language: str = "ur", align_lang: str = "ur", skip_start: float = 0.0):
+def main(audio_path: str, text_path: str, out_path: str, asr_model: str = "large-v3", asr_language: str = "ur", align_lang: str = DEFAULT_ALIGN_LANG, skip_start: float = 0.0):
     audio_bytes = Path(audio_path).read_bytes()
     gt_text = Path(text_path).read_text(encoding="utf-8")
     srt_text = run_alignment.remote(audio_bytes, gt_text, asr_model, asr_language, align_lang, skip_start)
@@ -789,7 +813,7 @@ def batch(
     out_dir: str = "timestamped_srts",
     asr_model: str = "large-v3",
     asr_language: str = "ur",
-    align_lang: str = "ur",
+    align_lang: str = DEFAULT_ALIGN_LANG,
 ):
     """Forced-align EP<start>..EP<end> from audio_dir/text_dir, fanned out across
     Modal GPU containers in parallel, writing one SRT per episode into out_dir.

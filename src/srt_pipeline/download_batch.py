@@ -122,6 +122,21 @@ def download_one(row: dict, out_dir: Path, audio_format: str, quality: str, extr
         # summary can list exactly what still needs fetching.
         "retries": 5,
         "fragment_retries": 5,
+        # NO js_runtimes key on purpose. YouTube needs a JavaScript runtime to solve its
+        # signature challenge, and yt-dlp's default is exactly what we want: {"deno": {}}.
+        # Setting this key REPLACES that default rather than adding to it, so
+        # {"node": {}} would silently DISABLE deno -- which is how this was first written,
+        # against a node too old to be accepted, leaving no usable runtime at all.
+        #
+        # Two host requirements this depends on, neither enforced by pip:
+        #   * deno >= 2.3.0 on PATH (yt-dlp also accepts node >= 22, bun >= 1.2.11,
+        #     quickjs >= 2023-12-09; anything older is reported "unsupported")
+        #   * the yt-dlp-ejs package, which carries the solver scripts -- a runtime alone
+        #     is NOT enough, and without it every provider reads "unavailable"
+        # Missing either one is not fatal: extraction falls back to JS-less clients, where
+        # "some formats may be missing" and the path is deprecated. That is the state that
+        # preceded the intermittent HTTP 403 costing 2 retries on B3003, so treat the
+        # "No supported JavaScript runtime could be found" warning as a real finding.
         **extra_opts,
     }
     try:

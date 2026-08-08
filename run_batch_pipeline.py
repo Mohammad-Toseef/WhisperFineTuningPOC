@@ -42,6 +42,7 @@ import os
 import re
 import subprocess
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent / "src" / "srt_pipeline"))
@@ -71,6 +72,12 @@ def modal_executable() -> str:
         if candidate.exists():
             return str(candidate)
     return "modal"
+
+
+def qa_stamp() -> str:
+    """UTC, sortable, filename-safe — so the newest report is also the last alphabetically,
+    which is what --compare relies on to pick a baseline."""
+    return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
 
 
 def child_environment() -> dict:
@@ -273,7 +280,14 @@ def do_run(args) -> int:
               "--manifest", str(paths.processed_dir / "manifest.json")],
         # Batch-wide like 5-6: the gate is cheap and a regression in an earlier episode
         # matters just as much as one in the episode just processed.
-        "qa": [sys.executable, "src/srt_pipeline/qa_gate.py", "--batch", args.batch]
+        # --json + --compare give the gate a memory. It re-scores every finished episode on
+        # each run, so without a record it can only say "passes now", never "this got worse"
+        # -- and a regression in an already-passing episode is precisely the kind of silent
+        # failure this pipeline keeps producing. The gate compares before it writes, so the
+        # new report never becomes its own baseline.
+        "qa": [sys.executable, "src/srt_pipeline/qa_gate.py", "--batch", args.batch,
+               "--json", str(paths.qa_reports_dir / f"{qa_stamp()}.json"),
+               "--compare", str(paths.qa_reports_dir)]
               + (["--warn-only"] if args.qa_warn_only else []),
     }
 

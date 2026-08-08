@@ -15,6 +15,7 @@ Layout for batch "batch3":
     data/batch3/audio_trimmed/           stage 2  batch_clean_intro_music.py
     data/batch3/timestamped_srts/        stage 3+4  modal_align.py
     data/batch3/vad_spans/               stage 3+4  detected speech turns (vad windows only)
+    data/batch3/qa_reports/              stage qa   one timestamped report per gate run
     data/batch3/asr_transcripts/         stage 3+4  pre-alignment MODEL output (unreviewed;
                                                     NOT round-1's human-verified
                                                     raw_transcripts/ -- see transcript_dir)
@@ -86,6 +87,19 @@ class BatchPaths:
         file there is one careless `*` away from being treated as an episode.
         """
         return self.root / "vad_spans"
+
+    @property
+    def qa_reports_dir(self) -> Path:
+        """One timestamped JSON per QA gate run.
+
+        Unlike every other artifact here these are NOT regenerable: they describe the output
+        of a state of the code that no longer exists once it changes. The gate on its own
+        only answers "does this pass now" -- and since it re-scores every finished episode on
+        each run, a change that quietly worsens an already-passing episode has nothing to be
+        noticed against. That is the exact failure mode this pipeline keeps producing:
+        output that is wrong while every check still reports pass.
+        """
+        return self.root / "qa_reports"
 
     @property
     def processed_dir(self) -> Path:

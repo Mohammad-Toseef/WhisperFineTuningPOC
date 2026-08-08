@@ -26,6 +26,7 @@ import json
 import statistics
 import subprocess
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))          # src/  -> srt_audio_prep
@@ -247,6 +248,70 @@ def fmt(seconds: float) -> str:
     return f"{int(seconds // 60):02d}:{seconds % 60:06.3f}"
 
 
+# Which way is bad, per metric, and how much movement is worth mentioning. Without the
+# tolerance a report is a wall of ±0.1 noise and the one number that actually moved is lost
+# in it.
+REGRESSION_DIRECTIONS = {
+    "word_loss_pct":    ("up", 0.2),
+    "coverage_pct":     ("down", 0.2),
+    "speech_loss_pct":  ("up", 0.1),
+    "gap_seconds":      ("up", 2.0),
+    "cues_over_rate":   ("up", 0.5),
+    "max_wps":          ("up", 0.5),
+}
+
+
+def latest_report(target: Path) -> Path | None:
+    """Newest *.json in `target` if it is a directory, else `target` itself."""
+    if target.is_dir():
+        reports = sorted(target.glob("*.json"))
+        return reports[-1] if reports else None
+    return target if target.exists() else None
+
+
+def compare_reports(current: list[dict], previous_path: Path) -> None:
+    """Print how each episode moved since a previous report.
+
+    The gate alone only answers "does this pass NOW". It cannot answer "was this better
+    last week" -- and because it re-scores every finished episode on each run, a change that
+    quietly worsens an already-passing episode would otherwise go unnoticed. That is exactly
+    the failure mode this whole session was about: output that is wrong while every check
+    still says pass.
+    """
+    payload = json.loads(previous_path.read_text(encoding="utf-8"))
+    # Accept both the current envelope and the older bare-list format.
+    rows = payload.get("episodes", payload) if isinstance(payload, dict) else payload
+    before = {r["stem"]: r for r in rows if isinstance(r, dict) and "stem" in r}
+    stamp = payload.get("generated_at", "unknown time") if isinstance(payload, dict) else "unknown time"
+
+    print(f"\nCompared against {previous_path.name} ({stamp})")
+    regressions, improvements, new = [], [], []
+    for report in current:
+        prior = before.get(report["stem"])
+        if not prior:
+            new.append(report["label"])
+            continue
+        for metric, (bad_direction, tolerance) in REGRESSION_DIRECTIONS.items():
+            if metric not in report or metric not in prior:
+                continue
+            delta = report[metric] - prior[metric]
+            if abs(delta) < tolerance:
+                continue
+            worse = (delta > 0) if bad_direction == "up" else (delta < 0)
+            line = (f"{report['label']} {metric} {prior[metric]:.1f} -> "
+                    f"{report[metric]:.1f} ({delta:+.1f})")
+            (regressions if worse else improvements).append(line)
+
+    for line in regressions:
+        print(f"  WORSE      {line}")
+    for line in improvements:
+        print(f"  better     {line}")
+    if new:
+        print(f"  new        {', '.join(new)} (not in the previous report)")
+    if not (regressions or improvements or new):
+        print("  no metric moved beyond its noise tolerance")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -255,6 +320,9 @@ def main() -> None:
     parser.add_argument("--warn-only", action="store_true",
                         help="Report failures but exit 0 (use to inspect a known-bad batch)")
     parser.add_argument("--json", help="Also write the full per-episode report here")
+    parser.add_argument("--compare", default="",
+                        help="Report how each metric moved since a previous report. Give a "
+                             "report file, or a directory to use its newest one.")
     parser.add_argument("--srt-dir", default="", help="Override data/<batch>/timestamped_srts")
     parser.add_argument("--transcript-dir", default="", help="Override data/<batch>/asr_transcripts")
     parser.add_argument("--audio-dir", default="", help="Override data/<batch>/audio_trimmed")
@@ -310,10 +378,35 @@ def main() -> None:
         for failure in r["failures"]:
             print(f"          - {failure}")
 
+    # Compare BEFORE writing: --compare and --json usually point at the same directory, so
+    # writing first would make this run its own baseline and always report "no change".
+    if args.compare:
+        previous = latest_report(Path(args.compare))
+        if previous is None:
+            print(f"\nNo previous report in {args.compare} — nothing to compare against.")
+        else:
+            compare_reports(reports, previous)
+
     if args.json:
-        Path(args.json).write_text(json.dumps(reports, indent=2, ensure_ascii=False),
-                                   encoding="utf-8")
-        print(f"\nWrote {args.json}")
+        out = Path(args.json)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        # The thresholds are CLI-overridable, so a report without them cannot be compared
+        # against another -- the same numbers can pass one run and fail the next. Record the
+        # limits and the layout that produced these figures, not just the figures.
+        payload = {
+            "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "batch": args.batch,
+            "limits": limits,
+            "gap_threshold": GAP_THRESHOLD,
+            "inputs": {"srt_dir": str(paths.srt_dir), "transcript_dir": str(paths.transcript_dir),
+                       "audio_dir": str(paths.audio_trimmed), "vad_dir": str(paths.vad_dir),
+                       "processed_dir": str(paths.processed_dir)},
+            "passed": len(reports) - len(failed),
+            "failed": len(failed),
+            "episodes": reports,
+        }
+        out.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+        print(f"\nWrote {out}")
 
     print(f"\n{len(reports) - len(failed)} passed | {len(failed)} failed")
     if failed and not args.warn_only:
