@@ -191,6 +191,102 @@ def fill_untimed_words(words: list[dict], segment_start: float,
     return filled, interpolated
 
 
+# A segment whose words stop this many seconds before its own window's speech does has
+# drifted, not merely ended early. 1.0s is comfortably past CTC's normal jitter and past a
+# clause-final pause; below it the repair would fire on ordinary segments and trade good
+# forced alignment for estimates. Measured across Batch 3 at this value: 3 windows on B3001
+# (5s), 14 on B3002 (51s), 5 on B3003 (9s) -- 22 of 300, so the other 278 keep CTC timing.
+MIN_UNCOVERED_TAIL = 1.0
+
+
+def clip_spans(spans, start: float, end: float) -> list[tuple[float, float]]:
+    """The parts of `spans` lying inside [start, end), clipped and sorted."""
+    out = []
+    for span_start, span_end in spans:
+        lo, hi = max(float(span_start), start), min(float(span_end), end)
+        if hi > lo:
+            out.append((lo, hi))
+    out.sort()
+    return out
+
+
+def uncovered_speech_tail(words: list[dict], window_end: float,
+                          speech: list[tuple[float, float]]) -> float:
+    """Seconds of detected speech after the last word, inside the segment's own window.
+
+    This is the drift signal. CTC cannot place Latin-script words (see fill_untimed_words),
+    and when a segment contains a long Latin run the Urdu anchors that FOLLOW it come back
+    wrong too -- not just the Latin ones. Confirmed by ear on B3002's 426.5-451.0s window:
+    the SRT put its last word at 441.5, and the speech from 441.5 to 451.0 was the text of
+    cues 96-98, spoken ~9s later than the SRT claimed.
+
+    Nothing in the SRT itself exposes that: indices are contiguous, timings monotonic, no
+    overlaps. Only the audio does, which is why this compares against VAD rather than
+    against the cues.
+    """
+    if not words:
+        return 0.0
+    last = max(float(w["end"]) for w in words)
+    return sum(end - start for start, end in clip_spans(speech, last, window_end))
+
+
+def redistribute_over_speech(words: list[dict], window_start: float, window_end: float,
+                             speech: list[tuple[float, float]]) -> list[dict]:
+    """Re-time a whole segment's words across the speech actually detected in its window.
+
+    Used ONLY when uncovered_speech_tail says the segment drifted. Every CTC anchor in it
+    is discarded, deliberately: the drift accumulates mid-segment (on B3002 the cue before
+    the bad one already sounded right, and the next one was wrong by its end), so any
+    "last good anchor" rule is a guess. Spreading across measured speech is defensible for
+    the whole segment at once.
+
+    Words are allocated in proportion to their character count -- a crude but monotonic
+    proxy for duration -- and mapped onto the speech spans with silences skipped, so no
+    word is placed in a pause. The result is an ESTIMATE, roughly +/-0.5s rather than CTC's
+    +/-0.05s, and every word is marked so a reviewer can tell the two apart. That trade is
+    right for chunk preparation: a slightly soft boundary that contains its words beats a
+    clip missing 9s of its own audio, or that audio being deleted as a gap.
+
+    Falls back to the full window when VAD reports no speech in it (shouldn't happen -- the
+    window came from VAD -- but an empty span list would otherwise divide by zero).
+    """
+    spans = clip_spans(speech, window_start, window_end) or [(window_start, window_end)]
+    total_speech = sum(end - start for start, end in spans)
+    weights = [max(1, len(str(w.get("word", "")).strip())) for w in words]
+    total_weight = sum(weights)
+    if total_speech <= 0 or total_weight <= 0:
+        return words
+
+    def at(offset: float, is_end: bool) -> float:
+        """Map an offset along the concatenated speech into real time.
+
+        `is_end` decides which side of a span boundary an exact hit belongs to. A word
+        ENDING on the boundary ends where the speech does; a word STARTING there begins at
+        the NEXT span, not in the silence that follows this one. Without the distinction a
+        word that happens to start exactly at a boundary is timestamped inside a pause --
+        which the silence-skipping is supposed to make impossible.
+        """
+        remaining = offset
+        for span_start, span_end in spans:
+            length = span_end - span_start
+            if remaining < length or (is_end and remaining <= length):
+                return span_start + remaining
+            remaining -= length
+        return spans[-1][1]
+
+    out, consumed = [], 0.0
+    for word, weight in zip(words, weights):
+        share = total_speech * weight / total_weight
+        timed = dict(word)
+        timed["start"] = at(consumed, is_end=False)
+        timed["end"] = at(min(consumed + share, total_speech), is_end=True)
+        timed["redistributed"] = True
+        timed.pop("score", None)  # a CTC confidence no longer describes this timing
+        out.append(timed)
+        consumed += share
+    return out
+
+
 def flatten_words(aligned_segments: list[dict]) -> list[dict]:
     words = []
     for seg in aligned_segments:
@@ -388,6 +484,7 @@ def align_segments_to_srt(
     align_lang: str,
     device: str,
     time_offset: float = 0.0,
+    speech_turns: list | None = None,
     log=lambda msg: print(msg, file=sys.stderr),
 ) -> str:
     """Forced-align segments whose text ALREADY came from a transcription model.
@@ -408,6 +505,12 @@ def align_segments_to_srt(
 
     `segments` items need "start", "end", "text". `time_offset` is added back to every
     cue -- use it when `audio` had leading seconds trimmed before being passed in.
+
+    `speech_turns` are VAD's detected speech spans ([{"start","end"}, ...]) for the whole
+    episode. Optional, and only available on the vad window path, where they are already
+    computed. When given, a segment whose words stop well before its own window's speech
+    does is re-timed against that speech -- see redistribute_over_speech. Without them that
+    drift is invisible and the segment ships mistimed, so pass them whenever you have them.
     """
     usable = [s for s in segments if str(s.get("text", "")).strip()]
     skipped = len(segments) - len(usable)
@@ -425,14 +528,42 @@ def align_segments_to_srt(
     # word lacking start/end -- so the text would vanish from the SRT entirely. On a real
     # episode that silently cost 5% of the transcript. Coarse timing is recoverable by a
     # human reviewer; missing text is not.
+    speech = sorted((float(t["start"]), float(t["end"])) for t in (speech_turns or []))
+
+    # whisperx.align REWRITES each segment's start/end to the extent of its aligned words.
+    # So the returned segment's "end" is the last word's end, and measuring the uncovered
+    # tail against it is always 0 -- the drift becomes invisible precisely where it matters.
+    # The VAD window bounds only survive on the INPUT segments, so pair them back by index.
+    # (align returns one segment per input; if that ever stops holding, fall back to the
+    # aligned bounds rather than pairing the wrong window with the wrong words.)
+    aligned_segments = aligned["segments"]
+    if len(aligned_segments) == len(usable):
+        source_windows = [(float(s["start"]), float(s["end"])) for s in usable]
+    else:
+        log(f"WARNING: alignment returned {len(aligned_segments)} segments for "
+            f"{len(usable)} inputs; drift repair falls back to aligned bounds and will "
+            f"under-detect")
+        source_windows = [(float(s["start"]), float(s["end"])) for s in aligned_segments]
+
     cues: list[dict] = []
     aligned_word_total = 0
     interpolated_total = 0
     fallback_segments = 0
-    for segment in aligned["segments"]:
+    redistributed_segments = 0
+    redistributed_words = 0
+    recovered_seconds = 0.0
+    for segment, (window_start, window_end) in zip(aligned_segments, source_windows):
         words, interpolated = fill_untimed_words(
-            segment.get("words", []), float(segment["start"]), float(segment["end"]))
+            segment.get("words", []), window_start, window_end)
         if words:
+            # Drift check BEFORE grouping: cue boundaries come from word times, so a
+            # segment repaired here yields correct cues without group_into_cues changing.
+            tail = (uncovered_speech_tail(words, window_end, speech) if speech else 0.0)
+            if tail > MIN_UNCOVERED_TAIL and len(words) > 1:
+                words = redistribute_over_speech(words, window_start, window_end, speech)
+                redistributed_segments += 1
+                redistributed_words += len(words)
+                recovered_seconds += tail
             aligned_word_total += len(words)
             interpolated_total += interpolated
             cues.extend(group_into_cues(words))
@@ -441,7 +572,7 @@ def align_segments_to_srt(
         if not text:
             continue
         fallback_segments += 1
-        cues.append({"start": float(segment["start"]), "end": float(segment["end"]), "text": text})
+        cues.append({"start": window_start, "end": window_end, "text": text})
 
     cues.sort(key=lambda cue: cue["start"])
     log(f"Aligned {aligned_word_total} words into {len(cues)} cues")
@@ -451,6 +582,17 @@ def align_segments_to_srt(
             f"interpolated between their timed neighbours — almost always Latin script or "
             f"digits, which are outside the Urdu aligner's vocabulary. Their text is exact; "
             f"their timing is an estimate.")
+    if redistributed_segments:
+        log(f"NOTE: {redistributed_segments} segment(s) ({redistributed_words} words) left "
+            f">{MIN_UNCOVERED_TAIL}s of detected speech uncovered at their own window's end "
+            f"— their CTC anchors had drifted, so they were re-timed across the detected "
+            f"speech, recovering {recovered_seconds:.0f}s. Timing there is an estimate "
+            f"(~±0.5s), not CTC-accurate; the text is unchanged.")
+    elif speech:
+        log("No segment drifted past its window's speech — all timings are CTC-accurate.")
+    if not speech:
+        log("NOTE: no VAD speech turns passed; segment drift cannot be detected or "
+            "repaired. Run the vad window path to enable it.")
     if fallback_segments:
         log(f"WARNING: {fallback_segments} segment(s) could not be word-aligned; kept with "
             f"coarse segment timing so their text is not lost")

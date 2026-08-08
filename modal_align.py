@@ -324,14 +324,21 @@ def transcribe_and_align(
 
         # ── Stage 4: forced-align (separate, much smaller wav2vec2 model) ───────
         srt_text = core.align_segments_to_srt(
-            audio, segments, align_lang, device="cuda", log=print,
+            audio, segments, align_lang, device="cuda",
+            speech_turns=speech_turns, log=print,
         )
         transcript_text = "\n".join(s["text"] for s in segments)
 
         # Persist to the volume BEFORE returning, so the result outlives the client.
         # Only on success: an empty SRT must not create a file, or the fetch-first check
         # would treat a failed episode as done and never retry it.
-        vad_payload = json.dumps({"duration": duration, "turns": speech_turns}) if speech_turns else ""
+        # "windows" is what makes re-alignment possible without re-transcribing: each entry
+        # pairs 1:1 with a line of the .txt, so realign can rebuild `segments` exactly.
+        vad_payload = json.dumps({
+            "duration": duration,
+            "turns": speech_turns,
+            "windows": [{"start": s["start"], "end": s["end"]} for s in segments],
+        }) if speech_turns else ""
 
         if out_stem and results_dir and srt_text.strip():
             from pathlib import Path as _Path
@@ -360,6 +367,78 @@ def transcribe_and_align(
 
         traceback.print_exc()
         return {"srt": "", "segments": 0, "cues": 0, "text": "", "vad": "",
+                "error": f"{type(exc).__name__}: {exc}"}
+    finally:
+        os.unlink(audio_path)
+
+
+@app.function(
+    image=image,
+    gpu="T4",             # wav2vec2 CTC only -- no large-v3, so A10G's headroom is wasted here
+    timeout=60 * 60,
+    volumes={VOLUME_PATH: volume},
+)
+def realign(audio_bytes: bytes, suffix: str, transcript_text: str, vad_payload: str,
+            align_lang: str = "ur") -> dict:
+    """Stage 4 ALONE: re-time an existing transcript. No Whisper pass, no new text.
+
+    Exists because the alignment code changed but the transcription did not. Re-running the
+    fused stage would pay for large-v3 again AND let the text drift -- Whisper decoding is
+    not bit-identical run to run -- so a difference in the output could not be attributed to
+    the alignment fix. This changes exactly one variable.
+
+    Reconstruction is exact, not approximate: transcribe_and_align writes the transcript as
+    one line per segment and records those segments as `windows` in the .vad.json, so the
+    two zip back together. The 1:1 count is asserted below rather than assumed -- a silent
+    off-by-one would pair every line with the wrong window and produce a plausible,
+    completely wrong SRT.
+    """
+    import os
+    import tempfile
+
+    import whisperx
+
+    import align_to_srt as core
+
+    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as handle:
+        handle.write(audio_bytes)
+        audio_path = handle.name
+
+    try:
+        payload = json.loads(vad_payload)
+        windows = payload.get("windows") or []
+        turns = payload.get("turns") or []
+        if not windows:
+            raise ValueError("vad payload has no 'windows'; cannot rebuild segments "
+                             "(re-run the fused stage 34 for this episode instead)")
+
+        lines = [line for line in transcript_text.split("\n") if line.strip()]
+        if len(lines) != len(windows):
+            raise ValueError(
+                f"transcript has {len(lines)} non-empty lines but the vad payload has "
+                f"{len(windows)} windows — they must correspond 1:1. Refusing to guess "
+                f"the pairing; re-run the fused stage 34 for this episode.")
+
+        segments = [{"start": float(w["start"]), "end": float(w["end"]), "text": line}
+                    for w, line in zip(windows, lines)]
+
+        audio = whisperx.load_audio(audio_path)
+        duration = len(audio) / whisperx.audio.SAMPLE_RATE
+        segments = core.repair_segment_windows(segments, duration, log=print)
+        srt_text = core.align_segments_to_srt(
+            audio, segments, align_lang, device="cuda", speech_turns=turns, log=print)
+
+        return {
+            "srt": srt_text,
+            "segments": len(segments),
+            "cues": len([b for b in srt_text.strip().split("\n\n") if b.strip()]),
+            "error": None,
+        }
+    except Exception as exc:
+        import traceback
+
+        traceback.print_exc()
+        return {"srt": "", "segments": 0, "cues": 0,
                 "error": f"{type(exc).__name__}: {exc}"}
     finally:
         os.unlink(audio_path)
@@ -458,6 +537,98 @@ def fetch_results(batch: str = "batch3", out_dir: str = "", asr_text_dir: str = 
         print(f"  fetched {stem}")
         fetched += 1
     print(f"\nFetched {fetched} | already local {present} | on volume {len(stems)}")
+
+
+@app.local_entrypoint()
+def realign_batch(
+    batch: str = "batch3",
+    only: str = "",
+    audio_dir: str = "",
+    out_dir: str = "",
+    asr_text_dir: str = "",
+    vad_dir: str = "",
+    align_lang: str = "ur",
+    backup_dir: str = "",
+):
+    """Re-align episodes that already have a transcript, WITHOUT re-transcribing.
+
+    Use after changing the alignment code. Needs three local inputs per episode -- the
+    trimmed audio, asr_transcripts/<stem>.txt, and vad_spans/<stem>.vad.json -- and skips
+    any episode missing one, since a partial input would mean guessing.
+
+    OVERWRITES the existing SRTs, so the previous ones are copied to --backup-dir first
+    (default: <srt_dir>_previous). Unlike transcribe_align this is NOT idempotent: an SRT
+    already being there is the normal case, not a reason to skip.
+
+        modal run modal_align.py::realign_batch --batch batch3
+        modal run modal_align.py::realign_batch --batch batch3 --only B3002
+    """
+    import shutil
+
+    from batch_paths import BatchPaths
+
+    paths = BatchPaths(batch)
+    audio_path_dir = Path(audio_dir) if audio_dir else paths.audio_trimmed
+    out_path_dir = Path(out_dir) if out_dir else paths.srt_dir
+    text_path_dir = Path(asr_text_dir) if asr_text_dir else paths.transcript_dir
+    vad_path_dir = Path(vad_dir) if vad_dir else paths.vad_dir
+    backup = Path(backup_dir) if backup_dir else out_path_dir.parent / f"{out_path_dir.name}_previous"
+
+    wanted = {token.strip() for token in only.split(",") if token.strip()}
+    jobs, skipped = [], []
+    for srt_file in sorted(out_path_dir.glob("*.srt")):
+        stem = srt_file.stem
+        if wanted and stem.split("_")[0] not in wanted:
+            continue
+        audio_file = next((audio_path_dir / f"{stem}{ext}"
+                           for ext in (".mp3", ".wav", ".m4a")
+                           if (audio_path_dir / f"{stem}{ext}").exists()), None)
+        text_file = text_path_dir / f"{stem}.txt"
+        vad_file = vad_path_dir / f"{stem}.vad.json"
+        missing = [name for name, ok in (("audio", audio_file is not None),
+                                         ("transcript", text_file.exists()),
+                                         ("vad spans", vad_file.exists())) if not ok]
+        if missing:
+            skipped.append(f"{stem.split('_')[0]} (no {', '.join(missing)})")
+            continue
+        jobs.append((srt_file, audio_file, text_file, vad_file))
+
+    if wanted:
+        found = {job[0].stem.split("_")[0] for job in jobs}
+        unknown = wanted - found - {s.split(" ")[0] for s in skipped}
+        if unknown:
+            raise SystemExit(f"--only referenced labels with no SRT: {sorted(unknown)}")
+    if skipped:
+        print(f"Skipping {len(skipped)}: {', '.join(skipped)}")
+    if not jobs:
+        print("Nothing to re-align.")
+        return
+
+    backup.mkdir(parents=True, exist_ok=True)
+    for srt_file, *_ in jobs:
+        shutil.copy2(srt_file, backup / srt_file.name)
+    print(f"Backed up {len(jobs)} SRT(s) to {backup}/")
+
+    call_args = [(audio_file.read_bytes(), audio_file.suffix,
+                  text_file.read_text(encoding="utf-8"),
+                  vad_file.read_text(encoding="utf-8"), align_lang)
+                 for _, audio_file, text_file, vad_file in jobs]
+    print(f"\nRe-aligning {len(call_args)} episode(s) — no transcription, text unchanged...")
+
+    failures = []
+    for (srt_file, *_), result in zip(jobs, realign.starmap(call_args)):
+        label = srt_file.stem.split("_")[0]
+        if result["error"] or not result["srt"].strip():
+            print(f"  {label}: FAILED — {result['error'] or 'empty SRT'}")
+            failures.append(label)
+            continue
+        srt_file.write_text(result["srt"], encoding="utf-8")
+        print(f"  {label}: {result['segments']} segments -> {result['cues']} cues -> {srt_file.name}")
+
+    print(f"\nDone. Rewrote {len(jobs) - len(failures)} SRT(s). Previous copies in {backup}/")
+    print("Next: re-run stage 5 (chunking) so the manifest picks up the new timings.")
+    if failures:
+        raise SystemExit(f"{len(failures)} episode(s) failed: {', '.join(failures)}")
 
 
 @app.local_entrypoint()
