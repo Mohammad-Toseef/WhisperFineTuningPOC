@@ -55,8 +55,13 @@ STAGE_NAMES = {
     "34": "transcribe + align (GPU)",
     "5": "chunk + manifest",
     "6": "normalize manifest",
+    "qa": "quality gate",
 }
-ALL_STAGES = ["0", "1", "2", "34", "5", "6"]
+# 'qa' runs last and is the only stage that can fail on OUTPUT quality rather than on a
+# crash. Every silent defect this pipeline has produced -- dropped words, deleted windows,
+# discarded speech, cues at 30x human speaking rate -- passed all structural checks, so
+# without this the driver reports success on unusable data.
+ALL_STAGES = ["0", "1", "2", "34", "5", "6", "qa"]
 
 
 def modal_executable() -> str:
@@ -258,13 +263,18 @@ def do_run(args) -> int:
         # with it the container runs on and commits its result to the volume, and the
         # next run recovers that for free (transcribe_align checks the volume first).
         "34": [modal_executable(), "run", "--detach", "modal_align.py::transcribe_align",
-               "--batch", args.batch, "--only", only]
+               "--batch", args.batch, "--only", only, "--windows", args.windows]
+              + (["--no-fetch"] if args.no_fetch else [])
               + (["--model-path", args.model_path] if args.model_path else []),
         # Stages 5-6 are batch-wide on purpose: both are incremental, and running them over
         # everything keeps the single combined manifest consistent with what is on disk.
         "5": [sys.executable, "src/batch_srt_prep.py", "--batch", args.batch],
         "6": [sys.executable, "src/normalize_manifest.py",
               "--manifest", str(paths.processed_dir / "manifest.json")],
+        # Batch-wide like 5-6: the gate is cheap and a regression in an earlier episode
+        # matters just as much as one in the episode just processed.
+        "qa": [sys.executable, "src/srt_pipeline/qa_gate.py", "--batch", args.batch]
+              + (["--warn-only"] if args.qa_warn_only else []),
     }
 
     for stage in stages:
@@ -308,6 +318,16 @@ def main() -> None:
     run_parser.add_argument("--sheet", help="Override the sheet name passed to stage 0")
     run_parser.add_argument("--xlsx", help="Override the spreadsheet passed to stage 0")
     run_parser.add_argument("--model-path", help="Fine-tuned model for stage 3+4 (default: the volume's whisper-urdu-final)")
+    run_parser.add_argument("--windows", choices=["chunks", "vad"], default="vad",
+                            help="How stage 3+4 draws segment windows: 'vad' = cut at detected "
+                                 "silence (default), 'chunks' = the old fixed 28s grid. See modal_align.py.")
+    run_parser.add_argument("--qa-warn-only", action="store_true",
+                            help="Let the quality gate report failures without stopping the run")
+    run_parser.add_argument("--no-fetch", action="store_true",
+                            help="Force stage 3+4 to recompute instead of reusing a result "
+                                 "committed to the volume. The cache is keyed by (batch, window "
+                                 "mode) and is blind to the alignment code, so pass this after "
+                                 "changing align_to_srt.py or the stale output comes back.")
     run_parser.add_argument("--sleep", type=float, default=3.0, help="Seconds between downloads (default: 3)")
     run_parser.add_argument("--cookies-from-browser", help="Pass through to stage 1 if YouTube demands sign-in")
     run_parser.add_argument("--cookies", help="Pass a cookies.txt through to stage 1")

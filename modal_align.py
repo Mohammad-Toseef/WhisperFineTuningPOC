@@ -36,6 +36,7 @@ Usage:
     modal run modal_align.py::fetch_results --batch batch3
 """
 
+import json
 import sys
 from pathlib import Path
 
@@ -65,9 +66,15 @@ FINAL_MODEL_PATH = f"{VOLUME_PATH}/model/whisper-urdu-final"
 RESULTS_SUBDIR = "srt_results"
 
 
-def results_dir_for(batch: str) -> tuple[str, str]:
-    """(container absolute path, volume-relative path) for a batch's results."""
-    relative = f"{RESULTS_SUBDIR}/{batch}"
+def results_dir_for(batch: str, windows: str = "vad") -> tuple[str, str]:
+    """(container absolute path, volume-relative path) for a batch's results.
+
+    The window mode is part of the path on purpose. Cached results are keyed by filename
+    stem, so without this a "vad" run would find the "chunks" result already sitting on the
+    volume and RECOVER it instead of running -- silently returning the very output the run
+    was meant to replace, and making the two paths look identical.
+    """
+    relative = f"{RESULTS_SUBDIR}/{batch}/{windows}"
     return f"{VOLUME_PATH}/{relative}", relative
 
 # Upper bounds are load-bearing: unbounded installs pulled transformers 5.x / torch 2.12
@@ -89,6 +96,150 @@ image = (
     ])
     .add_local_python_source("align_to_srt")
 )
+
+
+# How the segment windows handed to forced alignment get drawn.
+#
+#   "chunks" -- HF's long-form pipeline on a fixed 28s grid with a 4s/2s stride. Its
+#              timestamps are quantized to whole seconds and occasionally degenerate; on
+#              B3003 that stranded 52 words on a 0.62s cue (83.9 w/s vs a 2.68 median) and
+#              left 351s of speech uncovered. The stride also duplicates boundary text.
+#   "vad"    -- voice-activity detection, so windows START AND END WHERE SPEECH DOES.
+#              Round 1 built its windows this way. Measured on B3003: 95% of the audio the
+#              chunk path discards falls inside a window VAD would have built, and VAD
+#              still correctly rejects genuine non-speech (the 3.9s gap at 40:17).
+#
+# 30s matches Whisper's own input window, so a window needs no further chunking -- which is
+# what removes the degenerate-timestamp failure mode rather than repairing it.
+VAD_CHUNK_SIZE = 30
+VAD_ONSET, VAD_OFFSET = 0.5, 0.363
+
+
+def _segments_from_fixed_chunks(audio_path: str, duration: float, model_path: str,
+                                language: str) -> list[dict]:
+    """Original path: HF long-form decoding on a fixed grid, timestamps from the pipeline."""
+    import torch
+    from transformers import pipeline
+
+    # chunk_length_s + return_timestamps are what enable long-form decoding; a bare
+    # processor() call would silently truncate to Whisper's 30s window. Same 28s/(4,2)
+    # settings as scripts/compare_transcribe.py, which is known-good here.
+    pipe = pipeline(
+        "automatic-speech-recognition",
+        model=model_path,
+        chunk_length_s=28,
+        stride_length_s=(4, 2),
+        device=0,
+        torch_dtype=torch.float16,
+        generate_kwargs={"language": language, "task": "transcribe"},
+    )
+    result = pipe(audio_path, return_timestamps=True)
+    del pipe
+    torch.cuda.empty_cache()
+
+    # HF chunk timestamps are (start, end); the final chunk's end can be None, and a None
+    # start would break align(). Fill both from what we know.
+    segments, previous_end = [], 0.0
+    for chunk in result["chunks"]:
+        start, end = chunk.get("timestamp", (None, None))
+        start = previous_end if start is None else float(start)
+        end = duration if end is None else float(end)
+        if end <= start:
+            end = min(start + 0.1, duration)
+        segments.append({"start": start, "end": end, "text": chunk["text"].strip()})
+        previous_end = end
+    return segments
+
+
+def _speech_turns(scores) -> list[dict]:
+    """Binarize the VAD score curve into raw speech turns [{start, end}, ...].
+
+    Pure CPU post-process on a tensor _segments_from_vad has already computed, so this adds
+    no model load and no GPU pass -- the turns were simply being discarded.
+
+    NOT the same thing as the merged windows: merge_chunks pads to VAD_CHUNK_SIZE and
+    bridges short pauses, so on all three Batch 3 episodes 100% of the SRT's uncovered time
+    fell inside some merged window. The turns are what actually distinguishes speech from
+    silence, which is the whole point for the QA gate.
+
+    max_duration is deliberately huge: a turn split at 30s would report one continuous
+    stretch of speech as several, which changes nothing for coverage but makes the counts
+    misleading to read.
+    """
+    import traceback
+
+    from whisperx.vad import Binarize
+
+    # Broad catch, deliberately: the turns are a diagnostic by-product of a two-hour GPU
+    # job. Losing them must never cost the transcription. This is NOT the swallowed-error
+    # pattern that hid the volume.reload() bug -- the traceback is printed here, and their
+    # absence is reported loudly by the QA gate rather than silently degrading a metric.
+    try:
+        binarized = Binarize(max_duration=100000, onset=VAD_ONSET, offset=VAD_OFFSET)(scores)
+        return [{"start": round(float(s.start), 3), "end": round(float(s.end), 3)}
+                for s in binarized.get_timeline()]
+    except Exception:
+        print("WARNING: could not binarize VAD scores into speech turns; the QA gate will "
+              "fall back to charging all uncovered time. Transcription continues.")
+        traceback.print_exc()
+        return []
+
+
+def _segments_from_vad(audio, duration: float, model_path: str, language: str,
+                       batch_size: int) -> tuple[list[dict], list[dict]]:
+    """VAD path: cut windows at detected silence, then transcribe each window.
+
+    The window boundaries come from the AUDIO, never from the decoder, so a segment's
+    (start, end) is correct by construction and needs no repair. Each window is at most
+    Whisper's own 30s input, so it is transcribed whole -- no internal chunking, hence no
+    chunk timestamps to be wrong, and no stride overlap to duplicate boundary text.
+
+    Returns (segments, speech_turns). The turns are a free by-product -- see _speech_turns.
+    """
+    import torch
+    import whisperx
+    from transformers import pipeline
+    from whisperx.vad import load_vad_model, merge_chunks
+
+    sample_rate = whisperx.audio.SAMPLE_RATE
+    vad_model = load_vad_model(device="cuda", vad_onset=VAD_ONSET, vad_offset=VAD_OFFSET)
+    scores = vad_model({"waveform": torch.from_numpy(audio).unsqueeze(0),
+                        "sample_rate": sample_rate})
+    windows = merge_chunks(scores, VAD_CHUNK_SIZE, onset=VAD_ONSET, offset=VAD_OFFSET)
+    turns = _speech_turns(scores)
+    del vad_model
+    torch.cuda.empty_cache()
+
+    spans = [(max(0.0, float(w["start"])), min(duration, float(w["end"]))) for w in windows]
+    spans = [(s, e) for s, e in spans if e - s > 0.1]
+    covered = sum(e - s for s, e in spans)
+    speech = sum(t["end"] - t["start"] for t in turns)
+    print(f"VAD: {len(spans)} windows covering {covered:.0f}s of {duration:.0f}s "
+          f"({covered / duration * 100:.1f}%) | {len(turns)} speech turns "
+          f"totalling {speech:.0f}s ({speech / duration * 100:.1f}%)")
+
+    # No chunk_length_s here on purpose: every window already fits Whisper's input window,
+    # so the pipeline sees each as one utterance and returns text only -- there are no
+    # per-chunk timestamps to go wrong, because we are not asking for any.
+    pipe = pipeline(
+        "automatic-speech-recognition",
+        model=model_path,
+        device=0,
+        torch_dtype=torch.float16,
+        generate_kwargs={"language": language, "task": "transcribe"},
+    )
+    inputs = [{"raw": audio[int(s * sample_rate):int(e * sample_rate)],
+               "sampling_rate": sample_rate} for s, e in spans]
+    outputs = pipe(inputs, batch_size=batch_size)
+    del pipe
+    torch.cuda.empty_cache()
+
+    segments = []
+    for (start, end), output in zip(spans, outputs):
+        text = str(output["text"]).strip()
+        if text:
+            segments.append({"start": start, "end": end, "text": text})
+    return segments, turns
 
 
 @app.function(image=image, gpu="T4", timeout=3600)
@@ -125,6 +276,8 @@ def transcribe_and_align(
     model_path: str = FINAL_MODEL_PATH,
     out_stem: str = "",
     results_dir: str = "",
+    windows: str = "vad",
+    batch_size: int = 8,
 ) -> dict:
     """Stage 3+4 fused: fine-tuned Whisper transcribes, wav2vec2 CTC re-times.
 
@@ -140,7 +293,6 @@ def transcribe_and_align(
 
     import torch
     import whisperx
-    from transformers import pipeline
 
     import align_to_srt as core
 
@@ -149,40 +301,25 @@ def transcribe_and_align(
         audio_path = handle.name
 
     try:
-        # ── Stage 3: transcribe (the ONLY fine-tuned Whisper pass) ──────────────
-        # chunk_length_s + return_timestamps are what enable long-form decoding; a bare
-        # processor() call would silently truncate to Whisper's 30s window. Same
-        # 28s/(4,2) settings as scripts/compare_transcribe.py, which is known-good here.
-        pipe = pipeline(
-            "automatic-speech-recognition",
-            model=model_path,
-            chunk_length_s=28,
-            stride_length_s=(4, 2),
-            device=0,
-            torch_dtype=torch.float16,
-            generate_kwargs={"language": language, "task": "transcribe"},
-        )
-        result = pipe(audio_path, return_timestamps=True)
-        del pipe
-        torch.cuda.empty_cache()  # free large-v3 before loading the aligner
+        if windows not in ("chunks", "vad"):
+            raise ValueError(f"windows must be 'chunks' or 'vad', got {windows!r}")
 
         audio = whisperx.load_audio(audio_path)
         duration = len(audio) / whisperx.audio.SAMPLE_RATE
 
-        # HF chunk timestamps are (start, end); the final chunk's end can be None, and a
-        # None start would break align(). Fill both from what we know.
-        segments, previous_end = [], 0.0
-        for chunk in result["chunks"]:
-            start, end = chunk.get("timestamp", (None, None))
-            start = previous_end if start is None else float(start)
-            end = duration if end is None else float(end)
-            if end <= start:
-                end = min(start + 0.1, duration)
-            segments.append({"start": start, "end": end, "text": chunk["text"].strip()})
-            previous_end = end
+        # ── Stage 3: transcribe (the ONLY fine-tuned Whisper pass, either path) ──
+        if windows == "vad":
+            segments, speech_turns = _segments_from_vad(
+                audio, duration, model_path, language, batch_size)
+        else:
+            segments = _segments_from_fixed_chunks(audio_path, duration, model_path, language)
+            speech_turns = []  # the chunks path never runs VAD; nothing to report
+        torch.cuda.empty_cache()  # free the transcriber before loading the aligner
 
-        # The pipeline's chunk timestamps are approximate and sometimes degenerate, which
-        # makes alignment fail outright. Repair before aligning, not after.
+        # Repair runs on BOTH paths, but means different things. On "chunks" it is load
+        # bearing -- degenerate timestamps make alignment fail outright. On "vad" the
+        # windows come from the audio, so it should be a no-op; if it logs anything there,
+        # that is a finding worth reading, not routine maintenance.
         segments = core.repair_segment_windows(segments, duration, log=print)
 
         # ── Stage 4: forced-align (separate, much smaller wav2vec2 model) ───────
@@ -194,6 +331,8 @@ def transcribe_and_align(
         # Persist to the volume BEFORE returning, so the result outlives the client.
         # Only on success: an empty SRT must not create a file, or the fetch-first check
         # would treat a failed episode as done and never retry it.
+        vad_payload = json.dumps({"duration": duration, "turns": speech_turns}) if speech_turns else ""
+
         if out_stem and results_dir and srt_text.strip():
             from pathlib import Path as _Path
 
@@ -201,8 +340,11 @@ def transcribe_and_align(
             target.mkdir(parents=True, exist_ok=True)
             (target / f"{out_stem}.srt").write_text(srt_text, encoding="utf-8")
             (target / f"{out_stem}.txt").write_text(transcript_text, encoding="utf-8")
+            if vad_payload:
+                (target / f"{out_stem}.vad.json").write_text(vad_payload, encoding="utf-8")
             volume.commit()  # without this the writes stay container-local and are lost
-            print(f"committed {out_stem}.srt + .txt to {results_dir}")
+            print(f"committed {out_stem}.srt + .txt"
+                  f"{' + .vad.json' if vad_payload else ''} to {results_dir}")
 
         return {
             "srt": srt_text,
@@ -210,13 +352,14 @@ def transcribe_and_align(
             # Count blocks, not "\n\n" separators -- N cues yield N-1 of those.
             "cues": len([b for b in srt_text.strip().split("\n\n") if b.strip()]),
             "text": transcript_text,
+            "vad": vad_payload,
             "error": None,
         }
     except Exception as exc:
         import traceback
 
         traceback.print_exc()
-        return {"srt": "", "segments": 0, "cues": 0, "text": "",
+        return {"srt": "", "segments": 0, "cues": 0, "text": "", "vad": "",
                 "error": f"{type(exc).__name__}: {exc}"}
     finally:
         os.unlink(audio_path)
@@ -246,7 +389,21 @@ def read_volume_text(relative_path: str) -> str:
     return b"".join(volume.read_file(relative_path)).decode("utf-8")
 
 
-def save_result(srt_text: str, transcript_text: str, srt_file: Path, text_dir: Path) -> None:
+def read_volume_text_optional(relative_path: str) -> str:
+    """read_volume_text, but "" when the file is not there.
+
+    Only for genuinely optional sidecars: .vad.json is absent for every result committed
+    before it existed, and for every --windows chunks run. Missing must degrade the QA gate,
+    not fail the fetch.
+    """
+    try:
+        return read_volume_text(relative_path)
+    except (modal.exception.NotFoundError, FileNotFoundError):
+        return ""
+
+
+def save_result(srt_text: str, transcript_text: str, srt_file: Path, text_dir: Path,
+                vad_payload: str = "", vad_dir: Path | None = None) -> None:
     srt_file.write_text(srt_text, encoding="utf-8")
     # Keep the model's pre-alignment text. It costs nothing -- a string join over the same
     # single transcription pass -- and it is the ONLY reference against which alignment
@@ -254,25 +411,35 @@ def save_result(srt_text: str, transcript_text: str, srt_file: Path, text_dir: P
     # structural check on the SRT still passed.
     # UNREVIEWED machine output: never feed it anywhere that expects verified text.
     (text_dir / f"{srt_file.stem}.txt").write_text(transcript_text, encoding="utf-8")
+    # Detected speech turns, when the run produced them (vad windows only). The QA gate
+    # uses these to separate dropped speech from a pause the speaker took; without them it
+    # falls back to charging all uncovered time, which is ~2x too harsh.
+    if vad_payload and vad_dir is not None:
+        vad_dir.mkdir(parents=True, exist_ok=True)
+        (vad_dir / f"{srt_file.stem}.vad.json").write_text(vad_payload, encoding="utf-8")
 
 
 @app.local_entrypoint()
-def fetch_results(batch: str = "batch3", out_dir: str = "", asr_text_dir: str = ""):
+def fetch_results(batch: str = "batch3", out_dir: str = "", asr_text_dir: str = "",
+                  vad_dir: str = "", windows: str = "vad"):
     """Pull GPU results off the volume into the local batch directories.
 
     The recovery path after a disconnected run: the container already committed its work,
     so this costs no GPU. transcribe_align does this automatically before dispatching, so
     reach for this only to inspect or restore results without starting a run.
+
+    --windows must match the run that produced them; results are stored per window mode.
     """
     from batch_paths import BatchPaths
 
     paths = BatchPaths(batch)
     out_path_dir = Path(out_dir) if out_dir else paths.srt_dir
     text_path_dir = Path(asr_text_dir) if asr_text_dir else paths.transcript_dir
+    vad_path_dir = Path(vad_dir) if vad_dir else paths.vad_dir
     out_path_dir.mkdir(parents=True, exist_ok=True)
     text_path_dir.mkdir(parents=True, exist_ok=True)
 
-    _, relative = results_dir_for(batch)
+    _, relative = results_dir_for(batch, windows)
     stems = volume_result_stems(relative)
     if not stems:
         print(f"No results on the volume at {relative}/")
@@ -286,7 +453,8 @@ def fetch_results(batch: str = "batch3", out_dir: str = "", asr_text_dir: str = 
             continue
         save_result(read_volume_text(f"{relative}/{stem}.srt"),
                     read_volume_text(f"{relative}/{stem}.txt"),
-                    srt_file, text_path_dir)
+                    srt_file, text_path_dir,
+                    read_volume_text_optional(f"{relative}/{stem}.vad.json"), vad_path_dir)
         print(f"  fetched {stem}")
         fetched += 1
     print(f"\nFetched {fetched} | already local {present} | on volume {len(stems)}")
@@ -299,13 +467,27 @@ def transcribe_align(
     audio_dir: str = "",
     out_dir: str = "",
     asr_text_dir: str = "",
+    vad_dir: str = "",
     only: str = "",
     limit: int = 0,
     language: str = "ur",
     align_lang: str = "ur",
     model_path: str = FINAL_MODEL_PATH,
+    windows: str = "vad",
+    batch_size: int = 8,
+    no_fetch: bool = False,
 ):
     """Transcribe + align every trimmed episode of a batch, fanned out across GPUs.
+
+    --no-fetch forces a recompute instead of reusing a committed result. The volume cache
+    is keyed by (batch, window mode) and knows NOTHING about the alignment code, so after
+    changing align_to_srt.py a plain re-run would hand back the stale output and the fix
+    would look like it did nothing. Use it whenever the reason for re-running is a code
+    change rather than a crash.
+
+    --windows vad cuts segment windows at detected silence instead of on a fixed 28s grid.
+    See the VAD_CHUNK_SIZE comment for why that matters. Default stays "chunks" until the
+    two paths have been compared on the same episode.
 
     All paths derive from --batch (data/<batch>/...); pass an explicit path only for a
     one-off layout. --model-path selects which fine-tuned model transcribes, so a later
@@ -339,6 +521,7 @@ def transcribe_align(
         rows = rows[:limit]
 
     audio_path_dir, out_path_dir, text_path_dir = Path(audio_dir), Path(out_dir), Path(asr_text_dir)
+    vad_path_dir = Path(vad_dir) if vad_dir else paths.vad_dir
     out_path_dir.mkdir(parents=True, exist_ok=True)
     text_path_dir.mkdir(parents=True, exist_ok=True)
 
@@ -361,8 +544,10 @@ def transcribe_align(
     # Fetch-first: a previous run may have finished on the GPU and committed its results
     # while the client was gone (network drop, Ctrl-C, the cp1252 crash). Recovering those
     # is free; recomputing them is not.
-    container_results, relative_results = results_dir_for(batch)
-    if pending:
+    container_results, relative_results = results_dir_for(batch, windows)
+    if no_fetch:
+        print("--no-fetch: ignoring committed results, recomputing from audio")
+    if pending and not no_fetch:
         on_volume = volume_result_stems(relative_results)
         recovered = []
         for entry in list(pending):
@@ -371,7 +556,9 @@ def transcribe_align(
                 continue
             save_result(read_volume_text(f"{relative_results}/{srt_file.stem}.srt"),
                         read_volume_text(f"{relative_results}/{srt_file.stem}.txt"),
-                        srt_file, text_path_dir)
+                        srt_file, text_path_dir,
+                        read_volume_text_optional(f"{relative_results}/{srt_file.stem}.vad.json"),
+                        vad_path_dir)
             recovered.append(row["label"])
             pending.remove(entry)
         if recovered:
@@ -382,12 +569,16 @@ def transcribe_align(
         print("Nothing to do.")
         return
 
+    if windows not in ("chunks", "vad"):
+        raise SystemExit(f"--windows must be 'chunks' or 'vad', got {windows!r}")
+
     call_args = [
         (audio_file.read_bytes(), audio_file.suffix, language, align_lang, model_path,
-         srt_file.stem, container_results)
+         srt_file.stem, container_results, windows, batch_size)
         for _, audio_file, srt_file in pending
     ]
-    print(f"\nDispatching {len(call_args)} episode(s) to Modal using {model_path}...")
+    print(f"\nDispatching {len(call_args)} episode(s) to Modal using {model_path} "
+          f"[windows={windows}]...")
 
     failures = []
     for (row, audio_file, srt_file), result in zip(pending, transcribe_and_align.starmap(call_args)):
@@ -400,7 +591,8 @@ def transcribe_align(
             print(f"  {label}: FAILED — produced an empty SRT")
             failures.append(label)
             continue
-        save_result(result["srt"], result["text"], srt_file, text_path_dir)
+        save_result(result["srt"], result["text"], srt_file, text_path_dir,
+                    result.get("vad", ""), vad_path_dir)
         print(f"  {label}: {result['segments']} segments -> {result['cues']} cues -> {srt_file.name}")
 
     print(f"\nDone. Wrote {len(pending) - len(failures)} SRT(s) to {out_path_dir}/")

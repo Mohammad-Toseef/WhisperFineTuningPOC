@@ -14,6 +14,7 @@ Layout for batch "batch3":
     data/batch3/audio_raw/               stage 1  download_batch.py
     data/batch3/audio_trimmed/           stage 2  batch_clean_intro_music.py
     data/batch3/timestamped_srts/        stage 3+4  modal_align.py
+    data/batch3/vad_spans/               stage 3+4  detected speech turns (vad windows only)
     data/batch3/asr_transcripts/         stage 3+4  pre-alignment MODEL output (unreviewed;
                                                     NOT round-1's human-verified
                                                     raw_transcripts/ -- see transcript_dir)
@@ -68,6 +69,23 @@ class BatchPaths:
         without error and quietly produce wrong results.
         """
         return self.root / "asr_transcripts"
+
+    @property
+    def vad_dir(self) -> Path:
+        """Stage 3+4's detected speech turns, one <stem>.vad.json per episode.
+
+        Written only by the "vad" window path, where the VAD scores are already computed to
+        cut the windows -- binarizing them into turns is a CPU post-process on a tensor that
+        exists anyway, so this costs no extra GPU.
+
+        The QA gate needs it to tell DROPPED SPEECH from a pause the speaker actually took.
+        Without it the gate charges every uncovered second as loss, which measured ~2x too
+        harsh on both B3001 and B3002 (see the gap-share check in qa_gate.py).
+
+        Kept out of srt_dir on purpose: several stages glob that directory, and a sidecar
+        file there is one careless `*` away from being treated as an episode.
+        """
+        return self.root / "vad_spans"
 
     @property
     def processed_dir(self) -> Path:

@@ -108,6 +108,89 @@ def build_segments_with_gt_text(
     return segments_out
 
 
+# A word given an interpolated timestamp gets at least this long, so a degenerate span
+# cannot produce zero-duration words (which would read as an absurd words-per-second and
+# trip the QA gate on an artifact rather than a real defect).
+MIN_INTERPOLATED_DURATION = 0.02
+
+
+def fill_untimed_words(words: list[dict], segment_start: float,
+                       segment_end: float) -> tuple[list[dict], int]:
+    """Give a timestamp to words the CTC aligner could not place, instead of dropping them.
+
+    The Urdu wav2vec2 aligner's vocabulary is Urdu/Arabic characters only, so it returns
+    LATIN-SCRIPT WORDS AND DIGITS with no start/end -- present in the list, in the right
+    order, just untimed:
+
+        {"word": "کہ", "start": 2.662, "end": 2.782, "score": 0.302}
+        {"word": "highway"}          <- no timestamps
+        {"word": "system"}
+        {"word": "جس", "start": 3.863, ...}
+
+    flatten_words used to discard exactly those, which on B3002 deleted 372 of 372 Latin
+    words -- every occurrence of energy, kinetic, blood, arteries, valve, conduction -- and
+    left sentences as strings of stranded particles. It also opened holes in the timeline
+    (one 9.5s), and stage 5 then deleted THAT AUDIO TOO as non-speech filler. Round 1 never
+    hit this: its human transcripts were fully transliterated into Nastaliq, so there was no
+    Latin text to lose.
+
+    A run of untimed words lies between two words that WERE timed, so the interval is known
+    even though the exact split inside it is not; spread the run evenly across it. Timing
+    for these words is an estimate, not CTC-accurate -- which is why the count is returned
+    and reported rather than absorbed silently.
+
+    Returns (words with every entry timed, how many were interpolated). Returns ([], 0) when
+    no word in the segment was timed at all: with no anchor there is nothing to interpolate
+    between, and the caller's coarse-segment fallback handles that case.
+    """
+    def is_timed(word: dict) -> bool:
+        return "start" in word and "end" in word
+
+    if not words or not any(is_timed(w) for w in words):
+        return [], 0
+
+    source = [dict(w) for w in words]
+    filled: list[dict] = []
+    interpolated = 0
+    index, total = 0, len(source)
+    while index < total:
+        if is_timed(source[index]):
+            filled.append(source[index])
+            index += 1
+            continue
+        run_end = index
+        while run_end < total and not is_timed(source[run_end]):
+            run_end += 1
+        run = source[index:run_end]
+        # The interval is bounded by the previous word's end and the next timed word's
+        # start, so nothing placed inside it can ever overlap a neighbour.
+        left = float(filled[-1]["end"]) if filled else float(segment_start)
+        right = float(source[run_end]["start"]) if run_end < total else float(segment_end)
+
+        if right - left >= MIN_INTERPOLATED_DURATION * len(run):
+            step = (right - left) / len(run)
+            for offset, word in enumerate(run):
+                word["start"] = left + step * offset
+                word["end"] = left + step * (offset + 1)
+                word["interpolated"] = True
+                filled.append(word)
+        else:
+            # No room: two CTC-timed words sit flush against each other. Widening the run
+            # into the next word would break monotonicity, and shrinking it would make
+            # zero-duration words -- so attach the text to the adjacent word instead. The
+            # words survive, the timeline stays ordered, and no span is invented.
+            text = " ".join(str(word["word"]).strip() for word in run)
+            if filled:
+                filled[-1]["word"] = f"{filled[-1]['word']} {text}"
+                filled[-1]["absorbed"] = True
+            else:
+                source[run_end]["word"] = f"{text} {source[run_end]['word']}"
+                source[run_end]["absorbed"] = True
+        interpolated += len(run)
+        index = run_end
+    return filled, interpolated
+
+
 def flatten_words(aligned_segments: list[dict]) -> list[dict]:
     words = []
     for seg in aligned_segments:
@@ -344,12 +427,15 @@ def align_segments_to_srt(
     # human reviewer; missing text is not.
     cues: list[dict] = []
     aligned_word_total = 0
+    interpolated_total = 0
     fallback_segments = 0
     for segment in aligned["segments"]:
-        timed = [w for w in segment.get("words", []) if "start" in w and "end" in w]
-        if timed:
-            aligned_word_total += len(timed)
-            cues.extend(group_into_cues(timed))
+        words, interpolated = fill_untimed_words(
+            segment.get("words", []), float(segment["start"]), float(segment["end"]))
+        if words:
+            aligned_word_total += len(words)
+            interpolated_total += interpolated
+            cues.extend(group_into_cues(words))
             continue
         text = str(segment.get("text", "")).strip()
         if not text:
@@ -359,6 +445,12 @@ def align_segments_to_srt(
 
     cues.sort(key=lambda cue: cue["start"])
     log(f"Aligned {aligned_word_total} words into {len(cues)} cues")
+    if interpolated_total:
+        share = interpolated_total / aligned_word_total * 100 if aligned_word_total else 0.0
+        log(f"NOTE: {interpolated_total} word(s) ({share:.1f}%) had no CTC timing and were "
+            f"interpolated between their timed neighbours — almost always Latin script or "
+            f"digits, which are outside the Urdu aligner's vocabulary. Their text is exact; "
+            f"their timing is an estimate.")
     if fallback_segments:
         log(f"WARNING: {fallback_segments} segment(s) could not be word-aligned; kept with "
             f"coarse segment timing so their text is not lost")
