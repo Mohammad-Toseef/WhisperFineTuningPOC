@@ -16,6 +16,7 @@ Approach:
 """
 
 import argparse
+import bisect
 import difflib
 import sys
 from pathlib import Path
@@ -228,6 +229,69 @@ def uncovered_speech_tail(words: list[dict], window_end: float,
         return 0.0
     last = max(float(w["end"]) for w in words)
     return sum(end - start for start, end in clip_spans(speech, last, window_end))
+
+
+def segment_span(segment: dict) -> tuple[float, float]:
+    """(first word start, last word end) for an aligned segment, from its TIMED words.
+
+    Falls back to the segment's own start/end when nothing in it was timed -- whisperx
+    rewrites those to the aligned extent, which is useless for identifying the source window
+    but is all there is for a segment the aligner could not place.
+    """
+    starts = [float(w["start"]) for w in segment.get("words", []) if "start" in w]
+    ends = [float(w["end"]) for w in segment.get("words", []) if "end" in w]
+    if starts and ends:
+        return min(starts), max(ends)
+    start = float(segment.get("start", 0.0))
+    return start, float(segment.get("end", start))
+
+
+def group_by_window(segments: list[dict],
+                    windows: list[tuple[float, float]]) -> list[tuple[tuple[float, float], list[dict]]]:
+    """Assign aligned segments to their source windows BY TIME, not by list position.
+
+    `whisperx.align` does not return one segment per input -- on B3004 it returned 68 for 67
+    windows, splitting one window's text in two. Pairing the two lists by index therefore
+    misaligns EVERY pair after the split: a segment whose words live at 40-57s gets handed
+    the 57-86s window's bounds. The drift check then sees ~29s of "uncovered" speech that is
+    simply a different window, and the repair would relocate correct cues into audio they
+    have nothing to do with -- far worse than the drift it was meant to fix.
+
+    Windows come from VAD, so they are non-overlapping and ordered, which makes a segment's
+    time span an unambiguous pointer to its window. Grouping that way is correct whether the
+    aligner splits, merges, or returns exactly one segment per window, so the assumption
+    disappears instead of being defended by a guard.
+
+    Assignment is by GREATEST OVERLAP, not by a single anchor instant. A first attempt used
+    the first word's start and mis-distributed badly on B3004: 17 windows received more than
+    one segment while ~16 received none, from a single extra segment. VAD windows are
+    separated by silence and word times carry jitter, so one instant near a boundary lands on
+    the wrong side -- and a window that wrongly absorbs a neighbour's words then shows a late
+    final word and NO drift, silently masking the very thing being detected. Overlap uses the
+    whole span, so a stray edge cannot move a segment.
+
+    Returns [(window, [segments in it]), ...] for windows that received at least one segment,
+    in time order.
+    """
+    if not windows:
+        return []
+    starts = [start for start, _ in windows]
+    buckets: dict[int, list[dict]] = {}
+    for segment in segments:
+        span_start, span_end = segment_span(segment)
+        # Only windows that could overlap this span are worth scoring: the search starts one
+        # before the last window beginning at or before span_start.
+        first = max(0, bisect.bisect_right(starts, span_start) - 1)
+        best_index, best_overlap = first, -1.0
+        for index in range(first, len(windows)):
+            window_start, window_end = windows[index]
+            if window_start >= span_end and index > first:
+                break  # windows are ordered; nothing later can overlap
+            shared = min(span_end, window_end) - max(span_start, window_start)
+            if shared > best_overlap:
+                best_index, best_overlap = index, shared
+        buckets.setdefault(best_index, []).append(segment)
+    return [(windows[index], buckets[index]) for index in sorted(buckets)]
 
 
 def redistribute_over_speech(words: list[dict], window_start: float, window_end: float,
@@ -530,45 +594,54 @@ def align_segments_to_srt(
     # human reviewer; missing text is not.
     speech = sorted((float(t["start"]), float(t["end"])) for t in (speech_turns or []))
 
-    # whisperx.align REWRITES each segment's start/end to the extent of its aligned words.
-    # So the returned segment's "end" is the last word's end, and measuring the uncovered
-    # tail against it is always 0 -- the drift becomes invisible precisely where it matters.
-    # The VAD window bounds only survive on the INPUT segments, so pair them back by index.
-    # (align returns one segment per input; if that ever stops holding, fall back to the
-    # aligned bounds rather than pairing the wrong window with the wrong words.)
+    # whisperx.align REWRITES each segment's start/end to the extent of its aligned words, so
+    # the returned "end" is the last word's end and an uncovered tail measured against it is
+    # always 0 -- the drift goes invisible exactly where it matters. The window bounds survive
+    # only on the INPUT segments, and the aligner does NOT return one segment per input, so
+    # the two are matched by TIME. See group_by_window.
     aligned_segments = aligned["segments"]
-    if len(aligned_segments) == len(usable):
-        source_windows = [(float(s["start"]), float(s["end"])) for s in usable]
+    windows = sorted((float(s["start"]), float(s["end"])) for s in usable)
+    if speech:
+        groups = group_by_window(aligned_segments, windows)
+        split = sum(1 for _, segs in groups if len(segs) > 1)
+        if split or len(aligned_segments) != len(usable):
+            log(f"NOTE: alignment returned {len(aligned_segments)} segments for "
+                f"{len(usable)} windows; {split} window(s) received more than one and were "
+                f"regrouped by time (this is expected, not an error)")
     else:
-        log(f"WARNING: alignment returned {len(aligned_segments)} segments for "
-            f"{len(usable)} inputs; drift repair falls back to aligned bounds and will "
-            f"under-detect")
-        source_windows = [(float(s["start"]), float(s["end"])) for s in aligned_segments]
+        # No VAD turns -> no drift repair is possible anyway, so stay one-to-one with what
+        # the aligner returned. The chunks path can emit overlapping/degenerate windows,
+        # where grouping by time would merge segments that do not belong together.
+        groups = [((float(s["start"]), float(s["end"])), [s]) for s in aligned_segments]
 
     cues: list[dict] = []
     aligned_word_total = 0
     interpolated_total = 0
     fallback_segments = 0
-    redistributed_segments = 0
+    redistributed_windows = 0
     redistributed_words = 0
     recovered_seconds = 0.0
-    for segment, (window_start, window_end) in zip(aligned_segments, source_windows):
-        words, interpolated = fill_untimed_words(
-            segment.get("words", []), window_start, window_end)
+    for (window_start, window_end), members in groups:
+        # One word list per WINDOW: a window split across several aligned segments is filled
+        # and drift-checked as the single unit it physically is. Interpolation also now sees
+        # the true window bounds, so a trailing untimed run can reach the end of the window
+        # instead of collapsing onto the last timed word.
+        raw_words = [word for segment in members for word in segment.get("words", [])]
+        words, interpolated = fill_untimed_words(raw_words, window_start, window_end)
         if words:
-            # Drift check BEFORE grouping: cue boundaries come from word times, so a
-            # segment repaired here yields correct cues without group_into_cues changing.
+            # Drift check BEFORE cue grouping: cue boundaries derive from word times, so a
+            # window repaired here yields correct cues without group_into_cues changing.
             tail = (uncovered_speech_tail(words, window_end, speech) if speech else 0.0)
             if tail > MIN_UNCOVERED_TAIL and len(words) > 1:
                 words = redistribute_over_speech(words, window_start, window_end, speech)
-                redistributed_segments += 1
+                redistributed_windows += 1
                 redistributed_words += len(words)
                 recovered_seconds += tail
             aligned_word_total += len(words)
             interpolated_total += interpolated
             cues.extend(group_into_cues(words))
             continue
-        text = str(segment.get("text", "")).strip()
+        text = " ".join(str(s.get("text", "")).strip() for s in members).strip()
         if not text:
             continue
         fallback_segments += 1
@@ -582,8 +655,8 @@ def align_segments_to_srt(
             f"interpolated between their timed neighbours — almost always Latin script or "
             f"digits, which are outside the Urdu aligner's vocabulary. Their text is exact; "
             f"their timing is an estimate.")
-    if redistributed_segments:
-        log(f"NOTE: {redistributed_segments} segment(s) ({redistributed_words} words) left "
+    if redistributed_windows:
+        log(f"NOTE: {redistributed_windows} window(s) ({redistributed_words} words) left "
             f">{MIN_UNCOVERED_TAIL}s of detected speech uncovered at their own window's end "
             f"— their CTC anchors had drifted, so they were re-timed across the detected "
             f"speech, recovering {recovered_seconds:.0f}s. Timing there is an estimate "

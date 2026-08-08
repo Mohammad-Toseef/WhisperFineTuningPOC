@@ -95,12 +95,72 @@ def child_environment() -> dict:
     return environment
 
 
-def run(command: list[str], dry_run: bool, cwd: Path = REPO) -> int:
+class RunLog:
+    """Mirror everything the driver and its children print into a file.
+
+    Installed as sys.stdout for the duration of a run, so the driver's own prints are
+    captured, and child output is piped through write() rather than inheriting the terminal.
+    Both are needed: the interesting lines come from BOTH sides -- the driver reports which
+    stage started, the children report what actually happened inside it.
+
+    Written through unbuffered on purpose. A run that dies (or is Ctrl-C'd, or loses the
+    network mid-stage) must leave the log up to the point of death; a buffered tail would
+    discard exactly the lines that explain the failure.
+    """
+
+    def __init__(self, path: Path):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self.path = path
+        self.file = path.open("w", encoding="utf-8", errors="replace")
+        self.terminal = sys.stdout
+
+    def write(self, text: str) -> int:
+        self.terminal.write(text)
+        self.terminal.flush()
+        self.file.write(text)
+        self.file.flush()
+        return len(text)
+
+    def flush(self) -> None:
+        self.terminal.flush()
+        self.file.flush()
+
+    def close(self) -> None:
+        self.file.close()
+
+    # argparse and others probe these; without them a tee can break help output.
+    def isatty(self) -> bool:
+        return self.terminal.isatty()
+
+    @property
+    def encoding(self) -> str:
+        return getattr(self.terminal, "encoding", "utf-8") or "utf-8"
+
+
+def run(command: list[str], dry_run: bool, cwd: Path = REPO, log: RunLog | None = None) -> int:
     printable = " ".join(f'"{c}"' if " " in c else c for c in command)
     print(f"\n$ {printable}", flush=True)
     if dry_run:
         return 0
-    return subprocess.run(command, cwd=str(cwd), env=child_environment()).returncode
+    if log is None:
+        return subprocess.run(command, cwd=str(cwd), env=child_environment()).returncode
+
+    # Piped, not inherited, so the child's output reaches the log as well as the terminal.
+    # Read RAW BYTES in chunks rather than lines: yt-dlp draws its progress bar with \r and
+    # no newline, so readline() would block until a download finished and the log would
+    # gain nothing during the slowest stage. stderr is merged in -- a stage's traceback is
+    # the single most valuable thing a log can contain.
+    process = subprocess.Popen(
+        command, cwd=str(cwd), env=child_environment(),
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+    )
+    while True:
+        chunk = process.stdout.read(4096)
+        if not chunk:
+            break
+        log.write(chunk.decode("utf-8", errors="replace"))
+    process.stdout.close()
+    return process.wait()
 
 
 # ── status ────────────────────────────────────────────────────────────────────────
@@ -218,6 +278,50 @@ def select_labels(status: list[dict], args, prefix: str) -> list[str]:
 # ── run ───────────────────────────────────────────────────────────────────────────
 
 def do_run(args) -> int:
+    """Set up the run log, then execute the stages inside it.
+
+    --dry-run writes no log: it runs nothing, so a log would only add a file that looks like
+    a record of work that never happened.
+    """
+    if args.dry_run:
+        return run_stages(args, None)
+
+    paths = BatchPaths(args.batch)
+    log = RunLog(paths.logs_dir / f"{qa_stamp()}_{args.batch}.log")
+    saved_stdout = sys.stdout
+    sys.stdout = log  # captures the driver's OWN prints; children are piped in run()
+    started = datetime.now(timezone.utc)
+    code = 1
+    try:
+        print(f"{'=' * 78}")
+        print(f"run_batch_pipeline  {started.strftime('%Y-%m-%d %H:%M:%S')} UTC")
+        print(f"  batch    : {args.batch}")
+        print(f"  argv     : {' '.join(sys.argv[1:])}")
+        print(f"  stages   : {args.stages or ','.join(ALL_STAGES)}")
+        print(f"  windows  : {args.windows}   qa_warn_only={args.qa_warn_only}  "
+              f"no_fetch={args.no_fetch}")
+        print(f"  log      : {log.path}")
+        print(f"{'=' * 78}")
+        code = run_stages(args, log)
+        return code
+    except KeyboardInterrupt:
+        # Record the interruption IN the log. A run that just stops leaves a truncated file
+        # that is indistinguishable from a crash.
+        print("\n\nINTERRUPTED by the user (Ctrl-C)")
+        code = 130
+        raise
+    finally:
+        elapsed = (datetime.now(timezone.utc) - started).total_seconds()
+        print(f"\n{'=' * 78}")
+        print(f"exit {code} after {elapsed / 60:.1f} min  "
+              f"({datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC)")
+        print(f"{'=' * 78}")
+        sys.stdout = saved_stdout
+        log.close()
+        print(f"Log written to {log.path}")
+
+
+def run_stages(args, log: RunLog | None) -> int:
     paths = BatchPaths(args.batch)
     prefix = label_prefix_for(args.batch)
     stages = args.stages.split(",") if args.stages else ALL_STAGES
@@ -233,7 +337,7 @@ def do_run(args) -> int:
             command += ["--sheet", args.sheet]
         if args.xlsx:
             command += ["--xlsx", args.xlsx]
-        if run(command, args.dry_run) != 0:
+        if run(command, args.dry_run, log=log) != 0:
             return 1
     elif "0" in stages:
         print(f"\nSTAGE 0 — {STAGE_NAMES['0']}: {paths.validated_csv} exists "
@@ -298,7 +402,7 @@ def do_run(args) -> int:
         if stage == "6" and not (paths.processed_dir / "manifest.json").exists():
             print("no manifest.json yet -- skipping (stage 5 must succeed first)")
             continue
-        code = run(commands[stage], args.dry_run)
+        code = run(commands[stage], args.dry_run, log=log)
         if code != 0:
             print(f"\nSTAGE {stage} ({STAGE_NAMES[stage]}) exited {code} — stopping here.")
             print("Every stage is idempotent: fix the cause and re-run the same command; "

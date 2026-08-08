@@ -16,6 +16,7 @@ Layout for batch "batch3":
     data/batch3/timestamped_srts/        stage 3+4  modal_align.py
     data/batch3/vad_spans/               stage 3+4  detected speech turns (vad windows only)
     data/batch3/qa_reports/              stage qa   one timestamped report per gate run
+    data/batch3/logs/                    driver     one timestamped log per run (all stages)
     data/batch3/asr_transcripts/         stage 3+4  pre-alignment MODEL output (unreviewed;
                                                     NOT round-1's human-verified
                                                     raw_transcripts/ -- see transcript_dir)
@@ -87,6 +88,18 @@ class BatchPaths:
         file there is one careless `*` away from being treated as an episode.
         """
         return self.root / "vad_spans"
+
+    @property
+    def logs_dir(self) -> Path:
+        """One log file per driver run, capturing the driver AND every child stage.
+
+        Stage output used to exist only in terminal scrollback. Every defect found so far was
+        diagnosed from a line in that output -- the cp1252 crash, the 403, "no supported
+        JavaScript runtime", "68 segments for 67 windows", "17 windows received more than
+        one". A 93-video run cannot be watched live, and the run that eventually goes wrong
+        is the one nobody was looking at.
+        """
+        return self.root / "logs"
 
     @property
     def qa_reports_dir(self) -> Path:
