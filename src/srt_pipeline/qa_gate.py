@@ -34,6 +34,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))              # srt_pipe
 
 from batch_paths import BatchPaths, add_batch_argument  # noqa: E402
 from srt_audio_prep import GAP_THRESHOLD, parse_srt     # noqa: E402
+from repetition import find_repetition, load_chant_units  # noqa: E402
 
 # ── thresholds ───────────────────────────────────────────────────────────────────────
 # Deliberately set where a HUMAN would call the output unusable, not at the best number yet
@@ -68,6 +69,12 @@ DEFAULTS = {
     # observed on B3001 cue 81, which is why this is two conditions and not one.
     "rate_min_words": 3,
     "rate_min_duration": 0.5,
+    # Chunks in the manifest containing a repeated-word run. Stage 5 drops these at cue
+    # level, so the only tolerable number is ZERO -- anything above means the filter did not
+    # run (old manifest), was bypassed, or a run slipped its thresholds. This is the check
+    # that would have caught B3014 shipping 127 words of fabricated Urdu while passing every
+    # other gate.
+    "max_repetition_chunks": 0,
 }
 
 
@@ -122,6 +129,41 @@ def load_speech_turns(stem: str, vad_dir: Path) -> list[tuple[float, float]] | N
     return sorted((float(t["start"]), float(t["end"])) for t in turns)
 
 
+def load_exclusions(processed_dir: Path) -> dict:
+    """Stage 5's repetition ledger, keyed by video_id (== the SRT stem). {} when absent."""
+    path = processed_dir / "repetition_exclusions.json"
+    if not path.exists():
+        return {}
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    return payload.get("episodes", {}) if isinstance(payload, dict) else {}
+
+
+def subtract_spans(intervals: list[tuple[float, float]],
+                   removed: list[tuple[float, float]]) -> list[tuple[float, float]]:
+    """`intervals` minus `removed`, both sorted by start.
+
+    Used to take deliberately-excluded repetition out of VAD's speech turns before charging
+    anything as loss. Those seconds ARE speech -- 526s of real zikr in B3015 -- so without
+    this the gate correctly detects speech in the holes and wrongly calls a policy decision
+    data loss, failing an episode for doing exactly what it was told.
+    """
+    result = []
+    for start, end in intervals:
+        pieces = [(start, end)]
+        for cut_start, cut_end in removed:
+            if cut_end <= start or cut_start >= end:
+                continue
+            next_pieces = []
+            for piece_start, piece_end in pieces:
+                if cut_start > piece_start:
+                    next_pieces.append((piece_start, min(piece_end, cut_start)))
+                if cut_end < piece_end:
+                    next_pieces.append((max(piece_start, cut_end), piece_end))
+            pieces = [(a, b) for a, b in next_pieces if b > a]
+        result.extend(pieces)
+    return sorted(result)
+
+
 def overlap_seconds(start: float, end: float, intervals: list[tuple[float, float]]) -> float:
     """Seconds of [start, end) covered by `intervals`, which must be sorted by start."""
     total = 0.0
@@ -134,7 +176,8 @@ def overlap_seconds(start: float, end: float, intervals: list[tuple[float, float
     return total
 
 
-def measure(stem: str, paths: Layout, chunks: list[dict], limits: dict) -> dict:
+def measure(stem: str, paths: Layout, chunks: list[dict], limits: dict,
+            excluded: dict | None = None, chant_units: set[str] | None = None) -> dict:
     """All metrics for one episode. Missing inputs are reported, never guessed at."""
     srt_path = paths.srt_dir / f"{stem}.srt"
     txt_path = paths.transcript_dir / f"{stem}.txt"
@@ -154,6 +197,21 @@ def measure(stem: str, paths: Layout, chunks: list[dict], limits: dict) -> dict:
     report["duration"] = duration
     report["cues"] = len(cues)
 
+    # ── repetition deliberately excluded by stage 5 ───────────────────────────
+    # Everything below measures against a baseline with these REMOVED. They are not loss:
+    # they are audio and words we chose not to train on, and charging them would make the
+    # coverage, word-loss and speech-loss checks all fail an episode that is correct.
+    excluded = excluded or {}
+    excluded_spans = sorted((float(a), float(b)) for a, b in excluded.get("spans", []))
+    excluded_seconds = float(excluded.get("seconds_excluded", 0.0))
+    excluded_words = int(excluded.get("words_excluded", 0))
+    if excluded:
+        report["excluded_cues"] = excluded.get("cues_excluded", 0)
+        report["excluded_seconds"] = excluded_seconds
+        report["excluded_words"] = excluded_words
+        report["excluded_by_kind"] = excluded.get("by_kind", {})
+    expected_duration = max(0.0, duration - excluded_seconds)
+
     # ── words through the stages ──────────────────────────────────────────────
     srt_words = sum(len(text.split()) for _, _, text in cues)
     report["srt_words"] = srt_words
@@ -163,12 +221,16 @@ def measure(stem: str, paths: Layout, chunks: list[dict], limits: dict) -> dict:
         if chunks:
             manifest_words = sum(len(c["transcript"].split()) for c in chunks)
             report["manifest_words"] = manifest_words
-            loss = (asr_words - manifest_words) / asr_words * 100 if asr_words else 0.0
+            expected_words = max(0, asr_words - excluded_words)
+            loss = ((expected_words - manifest_words) / expected_words * 100
+                    if expected_words else 0.0)
             report["word_loss_pct"] = loss
             if loss > limits["max_word_loss"]:
+                detail = (f"asr {asr_words} - {excluded_words} repetition = {expected_words} "
+                          f"-> manifest {manifest_words}" if excluded_words
+                          else f"asr {asr_words} -> manifest {manifest_words}")
                 report["failures"].append(
-                    f"word loss {loss:.1f}% > {limits['max_word_loss']}% "
-                    f"(asr {asr_words} -> manifest {manifest_words})")
+                    f"word loss {loss:.1f}% > {limits['max_word_loss']}% ({detail})")
     else:
         report["notes"].append("no asr_transcripts/*.txt — word loss unmeasurable")
 
@@ -176,10 +238,16 @@ def measure(stem: str, paths: Layout, chunks: list[dict], limits: dict) -> dict:
     if chunks and duration:
         covered = sum(c["duration"] for c in chunks)
         report["chunk_seconds"] = covered
-        report["coverage_pct"] = covered / duration * 100
+        # Denominator is the audio we INTENDED to keep. Scoring B3015's 13% of excluded zikr
+        # against the raw duration reports 85% coverage on a correct build.
+        report["coverage_pct"] = covered / expected_duration * 100 if expected_duration else 0.0
+        if excluded_seconds:
+            report["raw_coverage_pct"] = covered / duration * 100
         if report["coverage_pct"] < limits["min_coverage"]:
+            basis = (f" (of {expected_duration:.0f}s kept, after {excluded_seconds:.0f}s "
+                     f"repetition excluded)" if excluded_seconds else "")
             report["failures"].append(
-                f"coverage {report['coverage_pct']:.1f}% < {limits['min_coverage']}%")
+                f"coverage {report['coverage_pct']:.1f}% < {limits['min_coverage']}%{basis}")
     elif not chunks:
         report["notes"].append("not in manifest — coverage and word loss unmeasurable")
 
@@ -197,7 +265,12 @@ def measure(stem: str, paths: Layout, chunks: list[dict], limits: dict) -> dict:
 
     turns = load_speech_turns(stem, paths.vad_dir)
     if turns is not None:
-        lost = sum(overlap_seconds(start, end, turns) for start, end in holes)
+        # Speech inside an excluded repetition span is speech we chose to drop, so it is not
+        # chargeable. Today these spans are covered by SRT cues and therefore rarely fall in
+        # a hole -- this keeps the two accounts consistent anyway, so a later change that
+        # filters the SRT itself cannot silently start charging them.
+        chargeable = subtract_spans(turns, excluded_spans) if excluded_spans else turns
+        lost = sum(overlap_seconds(start, end, chargeable) for start, end in holes)
         report["gap_speech_seconds"] = lost
         report["loss_basis"] = "vad"
     else:
@@ -220,10 +293,19 @@ def measure(stem: str, paths: Layout, chunks: list[dict], limits: dict) -> dict:
                 f"of the episode > {limits['max_speech_loss']}% (this audio is discarded)")
 
     # ── speaking rate: the only signal that catches a misplaced window ────────
+    # Repetition cues are skipped: they are not in the manifest, and a chanted اللہ x178
+    # legitimately runs at 10 w/s. Scoring them made B3015 fail on 59 "over-rate" cues that
+    # describe removed content -- a gate reporting a policy decision as a timing defect,
+    # which is how thresholds get quietly loosened until real regressions stop tripping.
+    def excluded_cue(start: float, end: float) -> bool:
+        span = end - start
+        return span > 0 and overlap_seconds(start, end, excluded_spans) / span > 0.5
+
     rates = [(len(text.split()) / (end - start), start, end, text)
              for start, end, text in cues
              if end - start > limits["rate_min_duration"]
-             and len(text.split()) >= limits["rate_min_words"]]
+             and len(text.split()) >= limits["rate_min_words"]
+             and not (excluded_spans and excluded_cue(start, end))]
     if rates:
         values = [r[0] for r in rates]
         report["median_wps"] = statistics.median(values)
@@ -241,6 +323,28 @@ def measure(stem: str, paths: Layout, chunks: list[dict], limits: dict) -> dict:
                 f"(worst {worst[0]:.1f} w/s: {len(worst[3].split())} words in "
                 f"{worst[2] - worst[1]:.2f}s at {fmt(worst[1])}) — median is "
                 f"{report['median_wps']:.2f}")
+
+    # ── repetition that survived into training data ───────────────────────────
+    # Scored on the MANIFEST, not the SRT: the SRT is the faithful record and legitimately
+    # still contains the zikr. What must be zero is repetition reaching a training sample.
+    # B3014 passed every check above while shipping 127 words of fabricated Urdu; nothing
+    # here looked at its text.
+    srt_repeats = [find_repetition(text, chant_units) for _, _, text in cues]
+    found = [r for r in srt_repeats if r]
+    report["srt_repetition_cues"] = len(found)
+    report["srt_suspect_loop_cues"] = sum(1 for r in found if r.kind == "suspect_loop")
+    if chunks:
+        hits = [(c, r) for c in chunks
+                if (r := find_repetition(c["transcript"], chant_units))]
+        report["manifest_repetition_chunks"] = len(hits)
+        report["manifest_repetition_words"] = sum(r.covered for _, r in hits)
+        if len(hits) > limits["max_repetition_chunks"]:
+            worst_chunk, worst_rep = max(hits, key=lambda h: h[1].covered)
+            report["failures"].append(
+                f"{len(hits)} manifest chunk(s) contain a repeated-word run "
+                f"(worst: {worst_rep.unit!r} x{worst_rep.repeats} = {worst_rep.covered} words, "
+                f"{worst_rep.kind}, in {Path(worst_chunk['audio_path']).name}) — this text "
+                f"trains the model to loop. Re-run stage 5 so the cue filter removes it.")
     return report
 
 
@@ -258,6 +362,10 @@ REGRESSION_DIRECTIONS = {
     "gap_seconds":      ("up", 2.0),
     "cues_over_rate":   ("up", 0.5),
     "max_wps":          ("up", 0.5),
+    "manifest_repetition_chunks": ("up", 0.5),
+    # Rising means the DECODER got worse, not the pipeline -- the filter removes these from
+    # training either way, so this is the only place a fabricating decoder shows up.
+    "srt_suspect_loop_cues":      ("up", 0.5),
 }
 
 
@@ -347,14 +455,17 @@ def main() -> None:
         print(f"No SRTs found in {paths.srt_dir}/ — nothing to check.")
         return
 
-    reports = [measure(stem, paths, grouped.get(stem, []), limits) for stem in stems]
+    exclusions = load_exclusions(paths.processed_dir)
+    chant_units = load_chant_units()
+    reports = [measure(stem, paths, grouped.get(stem, []), limits,
+                       exclusions.get(stem), chant_units) for stem in stems]
 
     # "gap s" is raw uncovered time; "spch s"/"lost%" is the part of it VAD calls speech --
     # the number the gate rules on. Showing both makes the correction visible instead of
     # replacing one opaque figure with another.
     header = (f"{'label':<8}{'min':>6}{'cues':>6}{'loss%':>7}{'cover%':>8}"
               f"{'gaps':>6}{'gap s':>7}{'spch s':>8}{'lost%':>7}"
-              f"{'medW/s':>8}{'maxW/s':>8}{'over':>6}  result")
+              f"{'medW/s':>8}{'maxW/s':>8}{'over':>6}{'rep s':>7}{'inMan':>6}  result")
     print(header)
     print("-" * len(header))
     for r in reports:
@@ -367,7 +478,9 @@ def main() -> None:
               f"{r.get('word_loss_pct', float('nan')):7.1f}{r.get('coverage_pct', float('nan')):8.1f}"
               f"{r.get('gaps_over_threshold', 0):6d}{r.get('gap_seconds', 0):7.0f}{speech}"
               f"{r.get('speech_loss_pct', float('nan')):7.1f}{r.get('median_wps', float('nan')):8.2f}"
-              f"{r.get('max_wps', float('nan')):8.1f}{r.get('cues_over_rate', 0):6d}  {mark}")
+              f"{r.get('max_wps', float('nan')):8.1f}{r.get('cues_over_rate', 0):6d}"
+              f"{r.get('excluded_seconds', 0):7.0f}{r.get('manifest_repetition_chunks', 0):6d}"
+              f"  {mark}")
 
     failed = [r for r in reports if r["failures"]]
     for r in reports:

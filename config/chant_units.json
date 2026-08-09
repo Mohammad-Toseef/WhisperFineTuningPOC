@@ -1,0 +1,22 @@
+{
+  "_comment": "Devotional formulae that are legitimately CHANTED in repetition (zikr). Used only by src/srt_pipeline/repetition.py to label a detected repeated run `chant` instead of `suspect_loop`. Adding a unit here NEVER changes what reaches the manifest -- repetition is excluded from training either way, because a fine-tune that sees a 178x repeated sample learns to loop. What this list changes is whether we believe the SRT TEXT: a `chant` run is correctly transcribed, a `suspect_loop` run is probably fabricated by the decoder and is the only signal we have that decode settings need fixing. Matching is on the normalized unit -- NFC, diacritics and punctuation stripped -- so write the bare form: 'اللہ ہو' also matches 'اللہ ہو،'.",
+
+  "_seeded": "2026-08-09 from the batch3 repetition scan (20 episodes). Deliberately conservative: only Allah-formulae confirmed by ear or unambiguous by form. Two observed units were left OFF pending review -- 'اٹھ' (B3004, 7 cues) and 'را ریاض' (B3015, 40 cues). Both may be genuine; until someone listens they classify as suspect_loop, which is the honest state. Check data/processed/<Batch>/repetition_exclusions.json for units to promote here.",
+
+  "units": [
+    "اللہ",
+    "یا اللہ",
+    "اللہ ہو",
+    "ہو",
+    "ھو",
+    "اللہ اللہ",
+    "لا الہ الا اللہ",
+    "سبحان اللہ",
+    "الحمد للہ",
+    "اللہ اکبر",
+    "استغفر اللہ",
+    "یا رسول اللہ",
+    "یا محمد",
+    "حق"
+  ]
+}

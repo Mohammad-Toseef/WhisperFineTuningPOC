@@ -43,6 +43,11 @@ from dataclasses import asdict
 
 from data_prep import Sample, validate_transcript
 
+sys.path.insert(0, str(Path(__file__).resolve().parent / "srt_pipeline"))
+from repetition import (  # noqa: E402
+    Repetition, find_repetition, is_continuation, load_chant_units,
+)
+
 sys.stdout.reconfigure(encoding="utf-8")
 
 SRT_TIME_RE = re.compile(r"(\d+):(\d+):(\d+),(\d+)")
@@ -236,6 +241,60 @@ def find_silence_boundary(
     return (start_sample + min_idx * hop_length) / sr
 
 
+def _by_unit(records: list[dict]) -> dict[str, int]:
+    """Repeated unit -> cue count, for a one-glance summary of WHAT repeated."""
+    counts: dict[str, int] = {}
+    for record in records:
+        key = f"{record['unit']}  [{record['kind']}]"
+        counts[key] = counts.get(key, 0) + 1
+    return counts
+
+
+def drop_repetition_cues(cues: list, chant_units: set[str]) -> tuple[list, list[dict]]:
+    """Remove cues that are a run of repeated words. Returns (kept, excluded records).
+
+    Filtering happens HERE -- on cues, before grouping -- and not on the assembled chunk
+    text, which is where validate_transcript() sits. On a chunk, one bad cue discards the
+    ~25s of clean speech grouped with it. On a cue, the loss is the cue itself: measured
+    across batch3's 290 repetition cues, only 3 had any legitimate words sharing the cue.
+
+    Dropping a cue leaves a hole, and prepare_from_srt already excludes holes wider than
+    GAP_THRESHOLD from chunk audio -- so the repeated audio is never cut in the first
+    place. No orphan .wav files to reconcile against the manifest.
+    """
+    found = [find_repetition(text, chant_units) for _, _, text in cues]
+
+    # Second pass: a long chant spans many cues, and the ones at each end carry only 2-3
+    # repeats or a truncated fragment. Judged alone they pass, then reach training as the
+    # looping text we are removing. Walk outward from every detected run and absorb
+    # neighbours built from that run's own words -- adjacency-bound, so ordinary 2x
+    # rhetorical repetition elsewhere in the episode is untouched.
+    for index, repetition in enumerate(list(found)):
+        if repetition is None:
+            continue
+        for step in (-1, 1):
+            neighbour = index + step
+            while 0 <= neighbour < len(cues) and found[neighbour] is None:
+                if not is_continuation(cues[neighbour][2], repetition.unit):
+                    break
+                words = len(cues[neighbour][2].split())
+                found[neighbour] = Repetition(
+                    repetition.unit, repetition.unit_tokens, repeats=0,
+                    covered=words, total=words, kind=repetition.kind,
+                    origin="continuation")
+                neighbour += step
+
+    kept, excluded = [], []
+    for index, ((start, end, text), repetition) in enumerate(zip(cues, found), start=1):
+        if repetition is None:
+            kept.append((start, end, text))
+            continue
+        excluded.append({"cue": index, "start": start, "end": end,
+                         "seconds": end - start, "words": len(text.split()),
+                         **repetition.as_dict(), "text": text[:120]})
+    return kept, excluded
+
+
 def prepare_from_srt(
     audio_path: str,
     srt_path: str,
@@ -244,12 +303,44 @@ def prepare_from_srt(
     search_before: float = 0.5,
     video_index: int = 1,
     write_manifest: bool = True,
+    exclusions: dict | None = None,
+    chant_units: set[str] | None = None,
 ) -> list[Sample]:
     video_id = make_video_id(audio_path, video_index)
     audio_dir = Path(output_dir) / "audio" / video_id
     audio_dir.mkdir(parents=True, exist_ok=True)
 
     cues = parse_srt(srt_path)
+    if chant_units is None:
+        chant_units = load_chant_units()
+    total_cues = len(cues)
+    cues, repetition = drop_repetition_cues(cues, chant_units)
+    if repetition:
+        kinds: dict[str, int] = {}
+        for record in repetition:
+            kinds[record["kind"]] = kinds.get(record["kind"], 0) + 1
+        seconds = sum(r["seconds"] for r in repetition)
+        words = sum(r["words"] for r in repetition)
+        print(f"  repetition: excluded {len(repetition)}/{total_cues} cues "
+              f"({seconds:.0f}s, {words} words) — "
+              + ", ".join(f"{count} {kind}" for kind, count in sorted(kinds.items())))
+        for unit, count in sorted(_by_unit(repetition).items(), key=lambda kv: -kv[1]):
+            print(f"      {count:>4}x  {unit}")
+        if exclusions is not None:
+            exclusions[video_id] = {
+                "srt": str(srt_path), "cues_total": total_cues,
+                "cues_excluded": len(repetition), "seconds_excluded": seconds,
+                "words_excluded": words, "by_kind": kinds,
+                "spans": [[r["start"], r["end"]] for r in repetition],
+                "excluded_cues": repetition,
+            }
+    if not cues:
+        # Every cue was repetition, or the SRT was empty. Both are worth saying out loud
+        # rather than crashing on windows[0] below or writing a silent zero-chunk episode.
+        print(f"  ⚠ no usable cues left for {video_id} "
+              f"({total_cues} parsed, {len(repetition)} excluded as repetition) — no chunks written")
+        return []
+
     # Group with headroom below max_duration: silence-snapping below can push
     # a chunk's boundaries later on both sides, so the *grouped* (pre-snap)
     # window must leave room or the final audio could exceed max_duration.

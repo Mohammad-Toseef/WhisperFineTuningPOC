@@ -17,10 +17,22 @@ import re
 import sys
 import json
 import argparse
+from datetime import datetime, timezone
 from pathlib import Path
 from dataclasses import asdict
 
 from srt_audio_prep import prepare_from_srt, find_youtube_id, make_video_id
+
+sys.path.insert(0, str(Path(__file__).resolve().parent / "srt_pipeline"))
+from repetition import (  # noqa: E402
+    MIN_REPEATS, MIN_SHARE, MIN_TOKENS, MAX_UNIT, CHANT_UNITS_PATH, load_chant_units,
+)
+
+# Sits next to manifest.json: it describes how that manifest was built, and the QA gate
+# reads it to tell "excluded on purpose" from "lost". Without it, removing 13% of an
+# episode as repetition looks identical to losing 13% to a bug -- and the gate would fail
+# the episode for doing exactly what we asked.
+EXCLUSIONS_FILENAME = "repetition_exclusions.json"
 
 sys.stdout.reconfigure(encoding="utf-8")
 
@@ -82,6 +94,46 @@ def load_existing_manifest(output_dir: str) -> list[dict]:
         return json.load(f)
 
 
+def load_existing_exclusions(output_dir: str) -> dict:
+    """Previous runs' repetition ledger, so a resumed batch merges rather than overwrites.
+
+    Mirrors load_existing_manifest: batch_prepare skips videos already in the manifest, so
+    without this the ledger would shrink to only the newly processed episodes while the
+    manifest kept all of them -- and the gate would then charge the older episodes'
+    deliberate exclusions as data loss.
+    """
+    path = Path(output_dir) / EXCLUSIONS_FILENAME
+    if not path.exists():
+        return {}
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    return payload.get("episodes", {}) if isinstance(payload, dict) else {}
+
+
+def write_exclusions(output_dir: str, episodes: dict, chant_units: set[str]) -> None:
+    totals = {
+        "episodes": len(episodes),
+        "cues_excluded": sum(e["cues_excluded"] for e in episodes.values()),
+        "seconds_excluded": sum(e["seconds_excluded"] for e in episodes.values()),
+        "words_excluded": sum(e["words_excluded"] for e in episodes.values()),
+    }
+    payload = {
+        "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        # Thresholds decide what got excluded, so a ledger without them cannot be compared
+        # against another one -- the same episode can yield different exclusions per run.
+        "policy": {"min_repeats": MIN_REPEATS, "min_share": MIN_SHARE,
+                   "min_tokens": MIN_TOKENS, "max_unit": MAX_UNIT,
+                   "chant_units_path": str(CHANT_UNITS_PATH),
+                   "chant_units_loaded": len(chant_units)},
+        "totals": totals,
+        "episodes": episodes,
+    }
+    path = Path(output_dir) / EXCLUSIONS_FILENAME
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(f"   Repetition ledger: {path} "
+          f"({totals['cues_excluded']} cues, {totals['seconds_excluded']:.0f}s, "
+          f"{totals['words_excluded']} words across {totals['episodes']} episode(s))")
+
+
 def batch_prepare(input_dir: str, output_dir: str, max_duration: float = 28.0, srt_dir: str | None = None):
     pairs = find_pairs(input_dir, srt_dir)
     where = input_dir if srt_dir is None else f"{input_dir} + {srt_dir}"
@@ -92,6 +144,12 @@ def batch_prepare(input_dir: str, output_dir: str, max_duration: float = 28.0, s
     already_done = {Path(s["audio_path"]).parent.name for s in existing_samples}
     if already_done:
         print(f"Existing manifest has {len(existing_samples)} chunks across {len(already_done)} video(s) -- merging new videos in")
+
+    chant_units = load_chant_units()
+    if not chant_units:
+        print(f"  ⚠ no chant units loaded from {CHANT_UNITS_PATH} — every repeated run will "
+              f"classify as suspect_loop (exclusion is unaffected; only the label is)")
+    exclusions = load_existing_exclusions(output_dir)
 
     all_samples = list(existing_samples)
     new_video_count = 0
@@ -106,6 +164,7 @@ def batch_prepare(input_dir: str, output_dir: str, max_duration: float = 28.0, s
             samples = prepare_from_srt(
                 audio_path, srt_path, output_dir, max_duration,
                 video_index=video_index, write_manifest=False,
+                exclusions=exclusions, chant_units=chant_units,
             )
         except Exception as e:
             print(f"  ✗ failed: {e}, skipping this video")
@@ -116,6 +175,9 @@ def batch_prepare(input_dir: str, output_dir: str, max_duration: float = 28.0, s
     manifest_path = Path(output_dir) / "manifest.json"
     with open(manifest_path, "w", encoding="utf-8") as f:
         json.dump(all_samples, f, ensure_ascii=False, indent=2)
+
+    if exclusions:
+        write_exclusions(output_dir, exclusions, chant_units)
 
     total_hours = sum(s["duration"] for s in all_samples) / 3600
     print(f"\n✅ Batch complete: {new_video_count} new video(s) processed, {len(all_samples)} total chunks across {len(already_done) + new_video_count} videos ({total_hours:.2f} hours)")
