@@ -28,6 +28,7 @@ Run:
 """
 import argparse
 import csv
+import random
 import subprocess
 import sys
 import time
@@ -168,12 +169,23 @@ def main() -> None:
              "'Sign in to confirm you're not a bot'.",
     )
     parser.add_argument("--cookies", help="Path to a Netscape-format cookies.txt, as an alternative to --cookies-from-browser")
+    # RANDOMISED, not fixed. A constant gap is itself a fingerprint -- requests arriving
+    # exactly N seconds apart for 90 videos look like automation no human produces, and a
+    # fixed 3s was not enough on its own: B3018 came back HTTP 403 mid-run and only
+    # succeeded on a retry with a longer wait. Jitter costs ~10s per video (~16 min across
+    # the remaining 76) and is far cheaper than a throttled batch.
     parser.add_argument(
-        "--sleep", type=float, default=3.0,
-        help="Seconds to wait between downloads (default: 3). Reduces the chance of "
-             "tripping YouTube's rate limiting across a long batch.",
+        "--sleep-min", type=float, default=5.0,
+        help="Lower bound of the random wait between downloads, in seconds (default: 5).",
+    )
+    parser.add_argument(
+        "--sleep-max", type=float, default=15.0,
+        help="Upper bound of the random wait between downloads, in seconds (default: 15). "
+             "Pass --sleep-min 0 --sleep-max 0 to disable waiting entirely.",
     )
     args = parser.parse_args()
+    if args.sleep_max < args.sleep_min:
+        parser.error(f"--sleep-max ({args.sleep_max}) is below --sleep-min ({args.sleep_min})")
 
     paths = BatchPaths(args.batch)
     csv_path = Path(args.csv) if args.csv else paths.validated_csv
@@ -210,8 +222,12 @@ def main() -> None:
     ok, failed, mismatched = [], [], []
 
     for index, row in enumerate(pending, start=1):
-        if index > 1 and args.sleep > 0:
-            time.sleep(args.sleep)
+        if index > 1 and args.sleep_max > 0:
+            delay = random.uniform(args.sleep_min, args.sleep_max)
+            # Printed, not silent: a run that stalls should be distinguishable from a run
+            # that is merely waiting, and the log is the only record of a 90-video batch.
+            print(f"   waiting {delay:.1f}s before the next download")
+            time.sleep(delay)
         print(f"\n[{index}/{len(pending)}] {row['label']}  {row['video_id']}")
         print(f"   {row['title'][:66]}")
         success, message = download_one(row, out_dir, args.format, args.quality, auth_opts)

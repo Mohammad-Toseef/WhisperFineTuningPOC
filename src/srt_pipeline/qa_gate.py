@@ -61,9 +61,23 @@ DEFAULTS = {
     # number seen -- the three measured episodes sit at 0.22-1.35%, so there is headroom,
     # but a real regression trips it.
     "max_speech_loss": 2.0,
-    # No cue may exceed this rate. Urdu here runs at a ~2.1-2.8 w/s median; 8 w/s is
-    # roughly 3x the median and far past what a person can say.
-    "max_words_per_second": 8.0,
+    # No cue may exceed this rate.
+    #
+    # Raised 8.0 -> 10.0 on 2026-08-09 after a CONFIRMED FALSE POSITIVE: the user listened to
+    # B3035 cue 11 (`تو یہ کیا کر رہا ہے؟`, 6 words in 0.70s = 8.6 w/s) and the words really
+    # are spoken that fast. Six two-letter function words in a fast question is ordinary
+    # speech, and B3035's median is 3.68 w/s -- that cue is only 2.3x its own episode, while
+    # the genuine defects sit at 4.4-4.5x.
+    #
+    # ⚠️ This is a BLUNT fix for a metric of the wrong SHAPE. A fixed number cannot separate
+    # "fast episode, short words" from "collapsed CTC anchor", because it ignores both the
+    # episode's own pace and word LENGTH. Measured across 30 episodes, the real defects are
+    # the cues containing LATIN script (`interest`, `game`, `300 series`, `Nokia`) -- exactly
+    # the words the Urdu aligner cannot time, whose timings are interpolated estimates. They
+    # separate cleanly on chars/sec (4.4-5.3x median) where words/sec does not (see the
+    # pending item on a relative rate bar). 10.0 keeps both of those failing while letting
+    # the short-question class through; it is not a claim that 10.0 is meaningful.
+    "max_words_per_second": 10.0,
     # A rate is only meaningful with enough words over enough time. Without BOTH guards a
     # legitimate one-word cue in a 0.04s sliver reports 25 w/s and fails the batch --
     # observed on B3001 cue 81, which is why this is two conditions and not one.

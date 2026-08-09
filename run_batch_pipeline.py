@@ -360,7 +360,8 @@ def run_stages(args, log: RunLog | None) -> int:
 
     commands = {
         "1": [sys.executable, "src/srt_pipeline/download_batch.py",
-              "--batch", args.batch, "--only", only, "--sleep", str(args.sleep)]
+              "--batch", args.batch, "--only", only,
+              "--sleep-min", str(args.sleep_min), "--sleep-max", str(args.sleep_max)]
              + (["--cookies-from-browser", args.cookies_from_browser] if args.cookies_from_browser else [])
              + (["--cookies", args.cookies] if args.cookies else []),
         "2": [sys.executable, "src/srt_pipeline/batch_clean_intro_music.py",
@@ -446,7 +447,11 @@ def main() -> None:
                                  "committed to the volume. The cache is keyed by (batch, window "
                                  "mode) and is blind to the alignment code, so pass this after "
                                  "changing align_to_srt.py or the stale output comes back.")
-    run_parser.add_argument("--sleep", type=float, default=3.0, help="Seconds between downloads (default: 3)")
+    # Randomised so the request pattern is not itself a fingerprint -- see download_batch.py.
+    run_parser.add_argument("--sleep-min", type=float, default=5.0,
+                            help="Lower bound of the random wait between downloads (default: 5)")
+    run_parser.add_argument("--sleep-max", type=float, default=15.0,
+                            help="Upper bound of the random wait between downloads (default: 15)")
     run_parser.add_argument("--cookies-from-browser", help="Pass through to stage 1 if YouTube demands sign-in")
     run_parser.add_argument("--cookies", help="Pass a cookies.txt through to stage 1")
 
