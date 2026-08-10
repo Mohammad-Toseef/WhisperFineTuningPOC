@@ -14,3 +14,6 @@ librosa>=0.10.1
 tensorboard>=2.16.0
 modal>=0.62.0
 pyyaml>=6.0
+pandas>=2.0.0          # batch sheet parsing (src/srt_pipeline/validate_sheet.py)
+openpyxl>=3.1.0        # .xlsx reader backend for pandas
+yt-dlp>=2025.1.1       # batch audio download (src/srt_pipeline/download_batch.py)

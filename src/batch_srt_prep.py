@@ -17,10 +17,22 @@ import re
 import sys
 import json
 import argparse
+from datetime import datetime, timezone
 from pathlib import Path
 from dataclasses import asdict
 
 from srt_audio_prep import prepare_from_srt, find_youtube_id, make_video_id
+
+sys.path.insert(0, str(Path(__file__).resolve().parent / "srt_pipeline"))
+from repetition import (  # noqa: E402
+    MIN_REPEATS, MIN_SHARE, MIN_TOKENS, MAX_UNIT, CHANT_UNITS_PATH, load_chant_units,
+)
+
+# Sits next to manifest.json: it describes how that manifest was built, and the QA gate
+# reads it to tell "excluded on purpose" from "lost". Without it, removing 13% of an
+# episode as repetition looks identical to losing 13% to a bug -- and the gate would fail
+# the episode for doing exactly what we asked.
+EXCLUSIONS_FILENAME = "repetition_exclusions.json"
 
 sys.stdout.reconfigure(encoding="utf-8")
 
@@ -34,20 +46,30 @@ def natural_sort_key(path: str) -> list:
     return [int(tok) if tok.isdigit() else tok.lower() for tok in re.split(r"(\d+)", Path(path).name)]
 
 
-def find_pairs(input_dir: str) -> list[tuple[str, str]]:
-    """Match audio files to .srt files in input_dir by shared YouTube ID."""
+def find_pairs(input_dir: str, srt_dir: str | None = None) -> list[tuple[str, str]]:
+    """Match audio files to .srt files by shared YouTube ID.
+
+    By default both live in input_dir (round-1 deliveries arrived that way). The batch
+    pipeline keeps them apart -- data/<batch>/audio_trimmed/ and
+    data/<batch>/timestamped_srts/ -- so pass srt_dir to scan a second directory rather
+    than staging a copy of every audio file next to its subtitle.
+    """
     audio_by_id = {}
     srt_by_id = {}
-    for path in Path(input_dir).iterdir():
-        if not path.is_file():
-            continue
-        youtube_id = find_youtube_id(str(path))
-        if youtube_id is None:
-            continue
-        if path.suffix.lower() == ".srt":
-            srt_by_id[youtube_id] = str(path)
-        elif path.suffix.lower() in AUDIO_EXTENSIONS:
-            audio_by_id[youtube_id] = str(path)
+    scan = [(Path(input_dir), True, srt_dir is None)]
+    if srt_dir is not None:
+        scan.append((Path(srt_dir), False, True))
+    for directory, take_audio, take_srt in scan:
+        for path in directory.iterdir():
+            if not path.is_file():
+                continue
+            youtube_id = find_youtube_id(str(path))
+            if youtube_id is None:
+                continue
+            if take_srt and path.suffix.lower() == ".srt":
+                srt_by_id[youtube_id] = str(path)
+            elif take_audio and path.suffix.lower() in AUDIO_EXTENSIONS:
+                audio_by_id[youtube_id] = str(path)
 
     pairs = []
     for youtube_id, audio_path in sorted(audio_by_id.items(), key=lambda kv: natural_sort_key(kv[1])):
@@ -72,15 +94,62 @@ def load_existing_manifest(output_dir: str) -> list[dict]:
         return json.load(f)
 
 
-def batch_prepare(input_dir: str, output_dir: str, max_duration: float = 28.0):
-    pairs = find_pairs(input_dir)
-    print(f"Found {len(pairs)} audio+srt pairs in {input_dir}")
+def load_existing_exclusions(output_dir: str) -> dict:
+    """Previous runs' repetition ledger, so a resumed batch merges rather than overwrites.
+
+    Mirrors load_existing_manifest: batch_prepare skips videos already in the manifest, so
+    without this the ledger would shrink to only the newly processed episodes while the
+    manifest kept all of them -- and the gate would then charge the older episodes'
+    deliberate exclusions as data loss.
+    """
+    path = Path(output_dir) / EXCLUSIONS_FILENAME
+    if not path.exists():
+        return {}
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    return payload.get("episodes", {}) if isinstance(payload, dict) else {}
+
+
+def write_exclusions(output_dir: str, episodes: dict, chant_units: set[str]) -> None:
+    totals = {
+        "episodes": len(episodes),
+        "cues_excluded": sum(e["cues_excluded"] for e in episodes.values()),
+        "seconds_excluded": sum(e["seconds_excluded"] for e in episodes.values()),
+        "words_excluded": sum(e["words_excluded"] for e in episodes.values()),
+    }
+    payload = {
+        "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        # Thresholds decide what got excluded, so a ledger without them cannot be compared
+        # against another one -- the same episode can yield different exclusions per run.
+        "policy": {"min_repeats": MIN_REPEATS, "min_share": MIN_SHARE,
+                   "min_tokens": MIN_TOKENS, "max_unit": MAX_UNIT,
+                   "chant_units_path": str(CHANT_UNITS_PATH),
+                   "chant_units_loaded": len(chant_units)},
+        "totals": totals,
+        "episodes": episodes,
+    }
+    path = Path(output_dir) / EXCLUSIONS_FILENAME
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(f"   Repetition ledger: {path} "
+          f"({totals['cues_excluded']} cues, {totals['seconds_excluded']:.0f}s, "
+          f"{totals['words_excluded']} words across {totals['episodes']} episode(s))")
+
+
+def batch_prepare(input_dir: str, output_dir: str, max_duration: float = 28.0, srt_dir: str | None = None):
+    pairs = find_pairs(input_dir, srt_dir)
+    where = input_dir if srt_dir is None else f"{input_dir} + {srt_dir}"
+    print(f"Found {len(pairs)} audio+srt pairs in {where}")
 
     existing_samples = load_existing_manifest(output_dir)
     # video_id is the audio chunk's parent folder name -- see make_video_id().
     already_done = {Path(s["audio_path"]).parent.name for s in existing_samples}
     if already_done:
         print(f"Existing manifest has {len(existing_samples)} chunks across {len(already_done)} video(s) -- merging new videos in")
+
+    chant_units = load_chant_units()
+    if not chant_units:
+        print(f"  ⚠ no chant units loaded from {CHANT_UNITS_PATH} — every repeated run will "
+              f"classify as suspect_loop (exclusion is unaffected; only the label is)")
+    exclusions = load_existing_exclusions(output_dir)
 
     all_samples = list(existing_samples)
     new_video_count = 0
@@ -95,6 +164,7 @@ def batch_prepare(input_dir: str, output_dir: str, max_duration: float = 28.0):
             samples = prepare_from_srt(
                 audio_path, srt_path, output_dir, max_duration,
                 video_index=video_index, write_manifest=False,
+                exclusions=exclusions, chant_units=chant_units,
             )
         except Exception as e:
             print(f"  ✗ failed: {e}, skipping this video")
@@ -106,6 +176,9 @@ def batch_prepare(input_dir: str, output_dir: str, max_duration: float = 28.0):
     with open(manifest_path, "w", encoding="utf-8") as f:
         json.dump(all_samples, f, ensure_ascii=False, indent=2)
 
+    if exclusions:
+        write_exclusions(output_dir, exclusions, chant_units)
+
     total_hours = sum(s["duration"] for s in all_samples) / 3600
     print(f"\n✅ Batch complete: {new_video_count} new video(s) processed, {len(all_samples)} total chunks across {len(already_done) + new_video_count} videos ({total_hours:.2f} hours)")
     print(f"   Combined manifest: {manifest_path}")
@@ -113,9 +186,23 @@ def batch_prepare(input_dir: str, output_dir: str, max_duration: float = 28.0):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--input_dir", required=True)
-    parser.add_argument("--output_dir", default="./data/processed/batch")
+    parser.add_argument("--batch", help="Batch name; derives input/srt/output dirs from data/<batch>/ (see src/srt_pipeline/batch_paths.py)")
+    parser.add_argument("--input_dir", help="Directory of audio files (default: data/<batch>/audio_trimmed)")
+    parser.add_argument("--srt_dir", help="Directory of .srt files when separate from --input_dir (default: data/<batch>/timestamped_srts)")
+    parser.add_argument("--output_dir", help="Chunk + manifest destination (default: data/processed/<Batch>)")
     parser.add_argument("--max_duration", type=float, default=28.0)
     args = parser.parse_args()
 
-    batch_prepare(args.input_dir, args.output_dir, args.max_duration)
+    if args.batch:
+        sys.path.insert(0, str(Path(__file__).parent / "srt_pipeline"))
+        from batch_paths import BatchPaths
+
+        paths = BatchPaths(args.batch)
+        args.input_dir = args.input_dir or str(paths.audio_trimmed)
+        args.srt_dir = args.srt_dir or str(paths.srt_dir)
+        args.output_dir = args.output_dir or str(paths.processed_dir)
+    if not args.input_dir:
+        parser.error("pass --batch, or --input_dir explicitly")
+    args.output_dir = args.output_dir or "./data/processed/batch"
+
+    batch_prepare(args.input_dir, args.output_dir, args.max_duration, args.srt_dir)
