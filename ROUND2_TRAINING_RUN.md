@@ -962,6 +962,29 @@ At the **end** of the run, two lines confirm the run was real rather than merely
 ---
 
 ## Open questions for discussion
+
+0. ★ **ROUND 3: should the encoder train at all?** Round 1 trained **only the decoder** — all 192
+   encoder LoRA modules (**23,592,960 params, 40.9% of the adapter**) had `lora_B == 0` and `lora_A`
+   still at random init, so they contributed `B @ A = 0` to every forward pass. Round 2 is
+   reproducing this, deliberately left unchanged so the r1↔r2 comparison stays attributable.
+
+   Cause: `enable_input_require_grads()` hooks `get_input_embeddings()` = the **decoder's**
+   `embed_tokens`. The encoder's input is a mel spectrogram through frozen convs
+   (`requires_grad=False`), and the **reentrant** gradient-checkpointing path decides whether to
+   build a backward graph from the *inputs* of the checkpointed block — parameters inside are
+   invisible to it. Reproduced locally; `backward()` does **not** raise, because the decoder supplies
+   a valid graph, which is why round 1 looked healthy.
+
+   Fix: `gradient_checkpointing_kwargs={"use_reentrant": False}` in `Seq2SeqTrainingArguments`.
+
+   For round 3, weigh: the encoder is *acoustic* adaptation (this speaker, the recording chain, Urdu
+   phonetics, recitation cadence) whereas spelling — the primary goal — lives in the decoder. Against
+   that: +41% learning capacity under an LR tuned for decoder-only, higher forgetting risk, and
+   non-reentrant checkpointing's extra saved-tensor bookkeeping may not fit A10G 24 GB at batch 8.
+   Needs its own baseline, not a mid-flight change.
+
+   Diagnostic: `python scripts/inspect_adapter.py <adapter> [--compare <other>]`.
+
 1. **Epoch count** — 3 (762 steps) is the proposal. 2 is cheaper and less forgetting-prone;
    4 risks overfitting a warm-started adapter. Round 1 converged at epoch 6 of 9 from scratch.
 2. **LR 5e-6** — halved from round 1 by judgement, not measurement. Alternative: keep 1e-5 and
