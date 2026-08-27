@@ -770,6 +770,105 @@ learning rate (then the epoch count), not the data.
 
 ---
 
+## 💰 Expected Modal cost (from ACTUAL round-1 billing, 2026-08-27)
+
+Pulled with `modal billing report --start 2026-07-24 --end … --show-resources --json`.
+
+⚠️ **Round 1's training was billed on 2026-07-24 UTC**, not the 2026-07-25 this project's docs
+record — the workspace is billed in UTC and the operator is UTC+5:30, so a run finishing early on
+the 25th IST lands on the 24th.
+
+| round-1 training day (2026-07-24) | |
+|---|---|
+| A10G | **$3.9612** → **3.60 GPU-hours** at $1.10/hr |
+| Memory (32 GB requested) | $0.9219 |
+| CPU | $0.2489 |
+| **day total** | **$5.13** |
+
+**All-in rate $1.43/hr — a 30% non-GPU overhead on the A10G line**, mostly the 32 GB memory
+request. A GPU-only estimate understates by that much. Cross-check: 3.60 GPU-h against the
+documented 3h14m training run leaves ~0.37 h, which is the baseline eval that ran the same day.
+
+### Round-2 projection
+
+| item | time | cost |
+|---|---|---|
+| training run | ~3.7–5.9 h | **$5.20–8.50** |
+| 3 standalone eval runs (720 clips each) | ~1.3–1.8 h | **$1.90–2.60** |
+| HF push (CPU only) | — | **$0.001** (measured) |
+| **total** | | **≈ $7–11, most likely ~$9** |
+
+Workload ratios driving it: training clip-passes **1.35×** round 1 (24,369 vs 18,099), in-training
+eval **0.98×**, clips to preprocess **3.92×** (8,843 vs 2,257).
+
+⚠️ Weakest part of the estimate: round 1's 194 min was split into phases (train/eval/prep/save) by
+inference, not from billed detail. The GPU-hours and the $1.43/hr rate are real; the phase split is
+reasoning, hence a ±30% band.
+
+### Project spend to date, for scale
+| app | total | of which GPU |
+|---|---|---|
+| `whisper-urdu-poc` (training + eval) | $6.63 | $5.12 |
+| `srt-forced-alignment` (all 96 Batch-3 episodes) | $5.08 | $4.75 |
+| `whisper-compare-transcribe` | $0.27 | $0.25 |
+| probes | $0.03 | $0.02 |
+| **Jul 1 – Sep 1** | **$12.02** | $10.14 |
+
+Transcribing + force-aligning all 96 episodes cost **$5.08**. Round 2 roughly doubles the project's
+lifetime Modal spend in one run, and still lands under $12.
+
+★ **A killed run is cheap: ~$2.14** for one epoch. That is change #6's value in money — a wrong
+learning rate costs $2 to discover instead of $8.
+
+⚠️ Volume storage did **not** appear as a line item in the report, so it is either below the
+reporting threshold or billed elsewhere — not confirmed free. Round 2 roughly doubles the volume
+(+4.4 GB dataset, +6.2 GB merged model).
+
+---
+
+## ✅ PRE-FLIGHT CODE REVIEW (2026-08-27) — 0 blocking issues
+
+Full read of the training path before launching. **Two real bugs found, both silent, both in code
+written during this session** — see commit `3aed2e2`:
+
+1. **`evaluate()` would MISLABEL every prediction row.** The sidecar is rejected on two conditions
+   (wrong length; right length but non-matching sentences), but the predictions sidecar decides
+   whether to attach `episode`/`source`/`buckets` labels by comparing **lengths** — so a
+   right-length/wrong-content sidecar passed that test and every row got a confident, wrong label.
+   Worse than no labels: it would have someone reading another episode's output believing it was
+   B3039's. Both branches now discard `bmeta`. The earlier test covered length-mismatch and empty,
+   **not** right-length/wrong-content, which is why it passed.
+2. **A merge failure would have discarded the adapter too.** `volume.commit()` ran once, after both
+   the adapter save and the 6.2 GB merged-model save. The adapter is the only irreplaceable output.
+   Now committed before the merge is attempted.
+
+Verified clean, no changes needed:
+
+| check | result |
+|---|---|
+| config keys the code reads | **21 training + 4 lora, all present in the yaml** |
+| `Seq2SeqTrainingArguments` | 21 args, all valid under the `<4.46` pin |
+| step schedule vs real manifest | 8,123 clips → 254/epoch → **762 = exactly 3 epochs** |
+| `save_steps % eval_steps` | 0, so `load_best_model_at_end` can resolve the best checkpoint |
+| `learning_rate` type | float `5e-06` (not the string `"5e-6"`) |
+| round-2 vs round-1 paths | **no collision**; resume source ≠ this run's output |
+| all 15 eval episodes | resolve → 474 (Set B) + 246 (Set A) = **720** |
+
+⚠️ Two warnings recorded, not fixed — same root cause: **`evaluation_strategy` and
+`Trainer(tokenizer=...)` were renamed in transformers 4.46.** Correct under the current pin; they
+break the moment the pin moves.
+
+### What to read in the first minute of the run
+`train()` prints these before any real GPU time is spent, and they are the confirmation that resume,
+`run_tag` and the dataset all point where intended:
+1. the **resolved layout** (dataset / resume / adapter / merged / ckpts / logs)
+2. `✅ N trainable / M total` — must be non-zero
+3. `✅ resume confirmed: N/M lora_B tensors carry trained (non-zero) weights`
+4. at **step 254 (epoch 1)**: `eval_wer_r1` — the forgetting tripwire. Far above 10.50% ⇒ stop,
+   lower the LR, restart. ~$2, not ~$8.
+
+---
+
 ## Open questions for discussion
 1. **Epoch count** — 3 (762 steps) is the proposal. 2 is cheaper and less forgetting-prone;
    4 risks overfitting a warm-started adapter. Round 1 converged at epoch 6 of 9 from scratch.
