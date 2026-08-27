@@ -1,4 +1,4 @@
-"""
+r"""
 Convert a reviewed manifest (exported from the review portal) back to the
 standard manifest.json format used by the training pipeline.
 
@@ -9,11 +9,18 @@ Reviewed format (flat list):
         "duration": 22.98,
         "language": "ur",
         "batch_name": "...",
-        "episode_label": "EP1",
+        "episode_label": "EP1",          # round 1; round 2 uses "B3001"
         "youtube_video_id": "hBK8bkFgus8",
         "chunk_index": 0,
         "status": "reviewed"
     }
+
+Episode labels are `<alpha-prefix><digits>` and BOTH styles must parse: round 1
+exported "EP1".."EP50", the Batch 3 pipeline assigns "B3001".."B3096" (see
+src/srt_pipeline/validate_sheet.py, which enforces `^[A-Za-z]+\d+$` so chunk
+ids stay deterministic). An EP-only pattern here silently matches nothing on a
+Batch 3 export, which reports every clip as unmatched rather than as a bad
+regex -- so the label pattern is defined once, below, and shared.
 
 Original format:
     {
@@ -34,6 +41,16 @@ import sys
 from pathlib import Path
 
 
+#: Episode-folder pattern: <alpha-prefix><digits>_<youtube_id>.
+#  Matches round 1's "EP5_vwzNL2oziZs" and round 2's "B3001_E5NiYnR-c98" alike.
+#  `(.+)` for the id (not `[\w-]+`) so ids that themselves start with "_"
+#  survive, e.g. "EP13__riVrVuUdOA".
+_FOLDER_RE = re.compile(r"^([A-Za-z]+\d+)_(.+)$")
+
+#: Same label shape, for sorting.
+_LABEL_RE = re.compile(r"^([A-Za-z]+)(\d+)")
+
+
 def parse_local_manifest(manifest_path: Path) -> dict[tuple, dict]:
     """Return a lookup: (episode_label, youtube_video_id, chunk_index) -> entry."""
     with open(manifest_path, encoding="utf-8") as f:
@@ -46,7 +63,7 @@ def parse_local_manifest(manifest_path: Path) -> dict[tuple, dict]:
         filename_stem = audio_path.stem               # e.g. EP1_hBK8bkFgus8_000
         chunk_index = int(filename_stem.rsplit("_", 1)[-1])
 
-        m = re.match(r"^(EP\d+)_(.+)$", folder_name)
+        m = _FOLDER_RE.match(folder_name)
         if not m:
             continue
         episode_label, youtube_video_id = m.group(1), m.group(2)
@@ -99,9 +116,17 @@ def build_global_lookup(
     return lookup, source_folder
 
 
-def _ep_num(episode_label: str) -> int:
-    m = re.match(r"EP(\d+)", episode_label)
-    return int(m.group(1)) if m else 0
+def _ep_num(episode_label: str) -> tuple[str, int]:
+    """Sort key for an episode label: ("EP", 5) / ("B3", 1).
+
+    Returns (prefix, number) rather than a bare int so a manifest spanning label
+    styles groups by prefix and then orders NUMERICALLY within it. A bare int
+    would interleave EP5 with B3005, and falling back to 0 for every
+    non-EP label -- as this did -- made all 96 Batch 3 rows compare equal, so
+    the coverage report came out in dict order instead of episode order.
+    """
+    m = _LABEL_RE.match(episode_label)
+    return (m.group(1), int(m.group(2))) if m else (episode_label, 0)
 
 
 def report_coverage(

@@ -252,15 +252,64 @@ visible if the two eval sources are reported separately — hence `wer_r1` / `we
 
 | # | File | Change | Severity |
 |---|---|---|---|
-| 1 | `scripts/convert_reviewed_manifest.py:49` | `^(EP\d+)_(.+)$` → `^([A-Za-z]+\d+)_(.+)$`; same for `_ep_num` | ⛔ **hard blocker** — does not match `B3001_…`, so every clip reports unmatched and the script exits 1 |
-| 2 | `src/dataset_builder.py` | accept **multiple** manifest paths (Batch 3 + round-1's 246 eval clips in one eval split); `_ep_num` generic | ⛔ required for the two-set eval |
-| 3 | `modal_app.py::train` | resume via `PeftModel.from_pretrained(model, ADAPTER, is_trainable=True)` instead of `get_peft_model` | ⛔ required |
+| 1 | ✅ **DONE** `scripts/convert_reviewed_manifest.py` | `^(EP\d+)_(.+)$` → shared `_FOLDER_RE = ^([A-Za-z]+\d+)_(.+)$`; `_ep_num` → `(prefix, number)` | ⛔ was a **hard blocker** — did not match `B3001_…` |
+| 2 | ✅ **DONE** `src/dataset_builder.py` | new **`--eval-only-manifest`** (repeatable) + generic `_ep_num` | ⛔ required for the two-set eval |
+| 3 | ✅ **DONE** `modal_app.py::train` | resume via `PeftModel.from_pretrained(model, adapter, is_trainable=True)`, behind `lora.resume_from_adapter` | ⛔ required |
 | 4 | `modal_app.py::train` | **assert trainable params > 0** after load | ⛔ see trap below |
 | 5 | `modal_app.py` | version output paths so round 1 is never clobbered | ⛔ see volume hygiene |
 | 6 | `modal_app.py::train` | `compute_metrics` reports `wer_r1` / `wer_b3` by slicing the eval order via `eval_buckets.json` | ★ the forgetting tripwire |
 | 7 | `modal_app.py::evaluate` | `--dataset-path` + `--model-path` overrides, **plus per-source reporting** (Set A vs Set B, derived from `eval_buckets.json`'s `episode` field) so one pass per model yields both | ★ needed for the final table; without the split it takes 6 runs instead of 3 |
 | 8 | `modal_app.py::train` | timeout 8 h → 12 h | ★ |
 | 9 | `config/training_config.yaml` | steps/warmup/eval_steps/LR per the table above; new `lora.resume_from_adapter` key | ★ |
+
+### Status of #1–#3 (built 2026-08-27)
+
+**#1** — regexes centralised as `_FOLDER_RE` / `_LABEL_RE`. Run on the real export:
+**8,597 / 8,597 across 96 episodes, 0 missing**, written to
+`data/processed/Batch3/manifest_reviewed.json` (42.49 hrs). Verified transcripts and durations
+survive 1:1 in order, all 8,597 `audio_path`s resolve on disk, no duplicates. `_ep_num` now sorts
+`("B3", 1) < ("EP", 5)` numerically within prefix — previously every B3 label returned 0 and so
+compared equal. Also made the module docstring raw: `\d` in a non-raw string emitted a
+`SyntaxWarning`.
+
+**#2** — `--eval-only-manifest PATH` (repeatable). Clips from it are **eval-eligible only**; any of
+its episodes not named in `--eval-episodes` are dropped, counted, and logged.
+
+⚠️ **Why a flag rather than just passing both manifests:** round 1's manifest as a second primary
+would put its other **42 episodes into TRAIN**, silently breaking the "Batch 3 only" decision.
+Hand-filtering the file instead just relocates the risk into an undocumented artifact that can
+drift. The flag makes it structural — an assertion fails the build if an eval-only clip reaches
+train. Three guards exit 1: the flag without `--eval-episodes`, an episode present in both corpora,
+and an unknown forced episode id (validated against the union, so real eval-only ids still pass).
+**6/6 tests pass, including that omitting the flag reproduces the previous output byte-identically.**
+
+**#3** — resume behind `lora.resume_from_adapter`; the fresh-adapter path is preserved, so round 1
+stays reproducible. Two guards raise rather than falling through to a fresh adapter: a
+`resume_from_adapter` that is not a directory, and one equal to the trainer's own output path.
+Also warns when the adapter's `r` / `alpha` / `target_modules` disagree with the yaml, since the
+adapter's values are what actually train — the cheapest version of that mistake is resuming the
+smoke test's q/v-only adapter while the yaml claims 6 Tier-2 targets.
+
+⚠️ `target_modules` is compared as a **set**, not a list. The volume's order is
+`v, out, q, fc1, k, fc2`; the yaml's is `q, k, v, out, fc1, fc2`. A list comparison would have
+reported a mismatch on **every** resume.
+
+⚠️ **NOT verified locally:** `torch` / `peft` / `transformers` are not installed outside the Modal
+image, so the `PeftModel.from_pretrained` call itself and "trainable params > 0 after load" are
+unchecked. That is exactly what change **#4** is for, on the first Modal run. What *was* checked
+locally: the drift comparison against the real `adapter_config.json` pulled from the volume (no
+drift, as expected), two negative controls proving the detector fires, and the presence of
+`is_trainable=True` in the call.
+
+### ⚠️ NEW ORDERING CONSTRAINT — #5 must land before #9
+`ADAPTER_PATH` is `/data/model/whisper-urdu-lora-adapter`, which is *also* where round 1's adapter
+lives. So setting `resume_from_adapter` to it while the trainer still saves there would have the run
+overwrite the adapter it is resuming from, partway through. #3's collision guard now **raises** on
+that, which means the config switch (#9) cannot be turned on until the output paths are versioned
+(#5). Enforced in code rather than left as a note.
+
+`lora.resume_from_adapter` is deliberately **absent** from `training_config.yaml` for now, so
+current behaviour is unchanged and round 1 remains reproducible.
 
 ### ⚠️ THE TRAP — `inference_mode: true`
 The round-1 `adapter_config.json` on the volume has `"inference_mode": true`. Loading it with
@@ -304,10 +353,12 @@ expect **~4.4 GB** for 8,843 clips. Local disk has 123 GB free.
 python scripts/convert_reviewed_manifest.py "data/processed/Batch3/Batch 3_reviewed_manifest.json" `
   --batch-folder Batch3 --output data/processed/Batch3/manifest_reviewed.json
 
-# 2. Build the dataset: Batch 3 train + combined (Set A + Set B) eval  (needs fix #2)
+# 2. Build the dataset: Batch 3 train + combined (Set A + Set B) eval
+#    Round 1's manifest comes in via --eval-only-manifest, so its other 42
+#    episodes are DROPPED rather than silently added to train.
 python src/dataset_builder.py `
-  data/processed/Batch3/manifest_reviewed.json data/processed/manifest_reviewed.json `
-  ./data/processed/dataset_r2 `
+  data/processed/Batch3/manifest_reviewed.json ./data/processed/dataset_r2 `
+  --eval-only-manifest data/processed/manifest_reviewed.json `
   --eval-episodes B3039_<ytid>,B3028_<ytid>,B3012_<ytid>,B3017_<ytid>,B3031_<ytid>,B3033_<ytid>,EP5_vwzNL2oziZs,EP6_SrVnpBqd7bI,EP34_h87EJF0Zvco,EP41_mBtP9NKha1g,EP43_m8-37sgUwUQ,EP44_paAJQ3OKB-8,EP47_a0NiZST0S6Q
 
 # 3. Upload (PowerShell, ROOT-RELATIVE remote paths, ~4.4 GB)

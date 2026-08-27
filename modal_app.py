@@ -52,7 +52,13 @@ image = (
     memory=32768,         # 32GB RAM
 )
 def train():
-    """Fine-tune Whisper medium on the prepared dataset."""
+    """Fine-tune Whisper large-v3 on the prepared dataset.
+
+    Two init modes, chosen by `lora.resume_from_adapter` in training_config.yaml:
+      unset  → FRESH LoRA adapter on the base model (round 1's behaviour)
+      set    → CONTINUE training that existing adapter (round 2)
+    """
+    import os
     import yaml
     import torch
     import numpy as np
@@ -66,7 +72,7 @@ def train():
         Seq2SeqTrainingArguments,
         Seq2SeqTrainer,
     )
-    from peft import LoraConfig, get_peft_model
+    from peft import LoraConfig, PeftModel, get_peft_model
     import evaluate
 
     # Load config
@@ -90,16 +96,74 @@ def train():
     # Enable gradient checkpointing to reduce VRAM usage
     model.config.use_cache = False
 
-    # ── LoRA (Path B) ──────────────────────────────────────────────
-    print("🔧 Wrapping model with LoRA adapters...")
-    lora_config = LoraConfig(
-        r=l_cfg["r"],
-        lora_alpha=l_cfg["lora_alpha"],
-        target_modules=l_cfg["target_modules"],
-        lora_dropout=l_cfg["lora_dropout"],
-        task_type=l_cfg.get("task_type"),  # None for Whisper (see config comment)
-    )
-    model = get_peft_model(model, lora_config)
+    # ── LoRA (Path B): FRESH adapter, or RESUME an existing one ────
+    # `get_peft_model` CREATES an adapter — it never continues one. LoRA inits
+    # lora_B to zeros, so a fresh adapter contributes exactly nothing at step 0
+    # and the run is training the plain base model. Continuing round 1 therefore
+    # requires loading its weights explicitly; nothing else in this file reads
+    # ADAPTER_PATH (it is only ever written, at the end of training).
+    resume_from = l_cfg.get("resume_from_adapter")
+
+    if resume_from:
+        # base large-v3 + round-1 adapter IS the round-1 model: the base weights
+        # were frozen throughout round 1, so they are the substrate, not the
+        # thing trained. Step 0 here reproduces round 1's outputs exactly.
+        if not os.path.isdir(resume_from):
+            raise FileNotFoundError(
+                f"lora.resume_from_adapter = {resume_from!r} is not a directory. "
+                "Refusing to fall through to a fresh adapter: that would silently "
+                "train the BASE model instead of continuing round 1, and would look "
+                "like a successful run."
+            )
+        # Guard until the output paths are versioned (plan change #5): resuming
+        # from the same path the trainer saves to would destroy round 1's adapter
+        # partway through the run.
+        if os.path.realpath(resume_from) == os.path.realpath(ADAPTER_PATH):
+            raise ValueError(
+                f"resume_from_adapter is the SAME path this run saves to ({ADAPTER_PATH}). "
+                "That would overwrite the adapter being resumed from. Point the round-2 "
+                "outputs at their own paths first."
+            )
+
+        print(f"🔁 RESUMING LoRA adapter from {resume_from}")
+        # is_trainable=True is REQUIRED. A saved adapter_config.json carries
+        # "inference_mode": true, and without this flag PEFT loads the adapter
+        # FROZEN — training then runs to completion, logs a loss curve, saves a
+        # model, and changes nothing at all.
+        model = PeftModel.from_pretrained(model, resume_from, is_trainable=True)
+
+        # The adapter's own config wins for r / alpha / target_modules, so a
+        # mismatch against training_config.yaml means the yaml is describing a
+        # different adapter than the one loaded. Surfaced because the cheapest
+        # version of this mistake — resuming the smoke test's q/v-only adapter
+        # while the yaml claims 6 Tier-2 targets — is otherwise invisible.
+        active = next(iter(model.peft_config.values()))
+        drift = []
+        if active.r != l_cfg["r"]:
+            drift.append(f"r: adapter={active.r} yaml={l_cfg['r']}")
+        if active.lora_alpha != l_cfg["lora_alpha"]:
+            drift.append(f"lora_alpha: adapter={active.lora_alpha} yaml={l_cfg['lora_alpha']}")
+        if set(active.target_modules or []) != set(l_cfg["target_modules"]):
+            drift.append(f"target_modules: adapter={sorted(active.target_modules or [])} "
+                         f"yaml={sorted(l_cfg['target_modules'])}")
+        if drift:
+            print("⚠️  Adapter/yaml MISMATCH — the ADAPTER's values are what train:")
+            for d in drift:
+                print(f"      {d}")
+        else:
+            print(f"   adapter matches yaml: r={active.r}, alpha={active.lora_alpha}, "
+                  f"{len(active.target_modules or [])} target modules")
+    else:
+        print("🔧 Wrapping model with a FRESH LoRA adapter...")
+        lora_config = LoraConfig(
+            r=l_cfg["r"],
+            lora_alpha=l_cfg["lora_alpha"],
+            target_modules=l_cfg["target_modules"],
+            lora_dropout=l_cfg["lora_dropout"],
+            task_type=l_cfg.get("task_type"),  # None for Whisper (see config comment)
+        )
+        model = get_peft_model(model, lora_config)
+
     # Required with gradient checkpointing + frozen base weights, otherwise
     # the backward pass has no grad_fn to reach the LoRA adapters.
     model.enable_input_require_grads()

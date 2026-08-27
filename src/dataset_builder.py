@@ -14,9 +14,23 @@ eval order: {episode, sentence, buckets}) that modal_app.py::evaluate reads to
 report per-bucket WER. Buckets: 'code_switch' | 'nastaliq_only' (mutually
 exclusive) and 'spiritual_term' (orthogonal).
 
+--eval-only-manifest (round 2)
+------------------------------
+Contributes clips that are eligible for the EVAL split ONLY. Round 2 trains on
+Batch 3 alone but must keep round 1's pinned eval episodes so its 10.50% stays
+comparable, i.e. two corpora in the eval split and exactly one in train.
+
+Passing round 1's manifest as the primary would put its other 42 episodes into
+TRAIN, silently breaking that decision -- and pre-filtering the file by hand
+just moves the risk into an undocumented artifact that can drift. So the
+constraint is structural instead: episodes from an --eval-only-manifest that are
+not named in --eval-episodes are DROPPED (counted and logged), and an assertion
+fails the build if any of their clips reach train.
+
 Usage:
     python src/dataset_builder.py <manifest_path> [output_path] [--eval-split 0.10]
         [--eval-episodes EP5,EP12,...] [--domain-terms config/domain_terms.json]
+        [--eval-only-manifest PATH ...]
 """
 import sys
 import re
@@ -56,9 +70,15 @@ def buckets_for(text: str, terms: list[str]) -> list[str]:
     return b
 
 
-def _ep_num(ep: str) -> int:
-    m = re.match(r"EP(\d+)", ep)
-    return int(m.group(1)) if m else 0
+def _ep_num(ep: str) -> tuple[str, int]:
+    """Sort key for an episode folder: ("EP", 5) / ("B3", 1).
+
+    (prefix, number), not a bare int: round 2's eval split holds BOTH label
+    styles, and the old `EP(\\d+)` pattern returned 0 for every B3 episode, so
+    they all compared equal and printed in arbitrary order.
+    """
+    m = re.match(r"^([A-Za-z]+)(\d+)", ep)
+    return (m.group(1), int(m.group(2))) if m else (ep, 0)
 
 
 def select_eval_episodes(
@@ -98,31 +118,87 @@ def select_eval_episodes(
     return chosen
 
 
+def _load_manifest(path: str) -> list[dict]:
+    p = Path(path)
+    if not p.exists():
+        print(f"ERROR: manifest not found: {p}", file=sys.stderr)
+        sys.exit(1)
+    with open(p, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _group_by_episode(samples: list[dict]) -> dict[str, list[dict]]:
+    by_episode: dict[str, list[dict]] = defaultdict(list)
+    for s in samples:
+        by_episode[episode_of(s)].append(s)
+    return by_episode
+
+
 def build_dataset(
     manifest_path: str,
     output_path: str,
     eval_split: float = 0.10,
     eval_episodes: list[str] | None = None,
     domain_terms_path: str = "config/domain_terms.json",
+    eval_only_manifests: list[str] | None = None,
 ):
-    with open(manifest_path, encoding="utf-8") as f:
-        samples = json.load(f)
-
+    samples = _load_manifest(manifest_path)
     terms = load_domain_terms(domain_terms_path)
 
-    by_episode: dict[str, list[dict]] = defaultdict(list)
-    for s in samples:
-        by_episode[episode_of(s)].append(s)
+    by_episode = _group_by_episode(samples)
 
-    eval_eps = set(select_eval_episodes(by_episode, terms, eval_split, eval_episodes))
+    # ── Eval-only corpora (round 2: round 1's pinned episodes) ──────
+    eval_only_by_ep: dict[str, list[dict]] = defaultdict(list)
+    for p in eval_only_manifests or []:
+        for ep, clips in _group_by_episode(_load_manifest(p)).items():
+            eval_only_by_ep[ep].extend(clips)
+
+    if eval_only_by_ep and not eval_episodes:
+        print("ERROR: --eval-only-manifest requires --eval-episodes. Auto-selection "
+              "is term-weighted over the TRAINING corpus and cannot decide which "
+              "eval-only episodes to keep, so it would silently drop all of them.",
+              file=sys.stderr)
+        sys.exit(1)
+
+    # An episode present in both corpora would be half-trainable, half-not.
+    overlap = sorted(set(eval_only_by_ep) & set(by_episode))
+    if overlap:
+        print(f"ERROR: episode(s) appear in BOTH the primary and an eval-only "
+              f"manifest: {overlap}. Remove them from one side.", file=sys.stderr)
+        sys.exit(1)
+
+    # Validate/choose eval episodes against the UNION, so a forced id living in
+    # an eval-only corpus is not reported as missing.
+    eval_eps = set(select_eval_episodes(
+        {**by_episode, **eval_only_by_ep}, terms, eval_split, eval_episodes
+    ))
 
     train_samples, eval_samples = [], []
     for ep, clips in by_episode.items():
         (eval_samples if ep in eval_eps else train_samples).extend(clips)
 
+    # Eval-only clips join eval if held out; otherwise they are DROPPED, never
+    # trained on. Counted and logged so the loss is visible, not inferred.
+    dropped: dict[str, int] = {}
+    for ep, clips in eval_only_by_ep.items():
+        if ep in eval_eps:
+            eval_samples.extend(clips)
+        else:
+            dropped[ep] = len(clips)
+    if dropped:
+        n = sum(dropped.values())
+        print(f"\nℹ️  Dropped {n} clip(s) from {len(dropped)} eval-only episode(s) not "
+              f"in --eval-episodes (never trained on, by design):")
+        for ep in sorted(dropped, key=_ep_num):
+            print(f"     {ep:<26} {dropped[ep]:>5} clips")
+
     # Sanity: no episode may appear in both splits (holdout invariant).
     assert not ({episode_of(s) for s in train_samples} & {episode_of(s) for s in eval_samples}), \
         "Episode leaked across train/eval"
+    # Sanity: eval-only corpora must NEVER reach train. This is the structural
+    # guarantee that round 2 trains on Batch 3 alone.
+    leaked = set(eval_only_by_ep) & {episode_of(s) for s in train_samples}
+    assert not leaked, f"eval-only episode(s) leaked into train: {sorted(leaked)}"
 
     def to_hf(sample_list):
         return {
@@ -148,11 +224,15 @@ def build_dataset(
     with open(Path(output_path) / "eval_buckets.json", "w", encoding="utf-8") as f:
         json.dump(eval_buckets, f, ensure_ascii=False, indent=2)
 
-    _report(by_episode, eval_eps, train_samples, eval_samples, terms)
+    _report(by_episode, eval_eps, train_samples, eval_samples, terms,
+            set(eval_only_by_ep))
     return dataset
 
 
-def _report(by_episode, eval_eps, train_samples, eval_samples, terms):
+def _report(by_episode, eval_eps, train_samples, eval_samples, terms,
+            eval_only_eps: set[str] | None = None):
+    eval_only_eps = eval_only_eps or set()
+
     def bucket_counts(samples):
         c = defaultdict(int)
         for s in samples:
@@ -162,12 +242,27 @@ def _report(by_episode, eval_eps, train_samples, eval_samples, terms):
 
     tr, ev = bucket_counts(train_samples), bucket_counts(eval_samples)
     print("\n" + "=" * 56)
-    print(f"  Episodes: {len(by_episode)} total  |  {len(eval_eps)} held out for eval")
+    print(f"  Episodes: {len(by_episode)} trainable corpus  |  "
+          f"{len(eval_eps)} held out for eval")
     print(f"  HELD-OUT: {sorted(eval_eps, key=_ep_num)}")
     print("-" * 56)
     print(f"  {'bucket':<16}{'train':>10}{'eval':>10}")
     for b in ("nastaliq_only", "code_switch", "spiritual_term"):
         print(f"  {b:<16}{tr[b]:>10}{ev[b]:>10}")
+
+    # With an eval-only corpus the eval split spans TWO corpora whose WERs are
+    # not comparable to each other. Break it down here so that is visible at
+    # build time rather than discovered when reading the results.
+    if eval_only_eps:
+        primary = [s for s in eval_samples if episode_of(s) not in eval_only_eps]
+        extra = [s for s in eval_samples if episode_of(s) in eval_only_eps]
+        pb, eb = bucket_counts(primary), bucket_counts(extra)
+        print("-" * 56)
+        print("  EVAL SPLIT BY SOURCE (report these separately, never averaged)")
+        print(f"  {'source':<16}{'clips':>10}{'code_switch':>13}")
+        print(f"  {'primary':<16}{len(primary):>10}{pb['code_switch']:>13}")
+        print(f"  {'eval-only':<16}{len(extra):>10}{eb['code_switch']:>13}")
+
     print("-" * 56)
     print(f"  ✅ {len(train_samples)} train / {len(eval_samples)} eval clips "
           f"({len(eval_samples) / (len(train_samples) + len(eval_samples)):.0%} eval)")
@@ -186,10 +281,18 @@ def main():
                    help="Comma-separated episode ids to force as eval (e.g. EP5,EP12). Overrides --eval-split.")
     p.add_argument("--domain-terms", default="config/domain_terms.json",
                    help="Path to domain_terms.json for spiritual-term bucketing.")
+    p.add_argument("--eval-only-manifest", action="append", default=None,
+                   metavar="PATH",
+                   help="Extra manifest whose clips may ONLY enter the eval split "
+                        "(repeatable). Requires --eval-episodes; any of its episodes "
+                        "not named there are dropped, never trained on. Used in round 2 "
+                        "to keep round 1's pinned eval episodes while training on Batch 3 "
+                        "alone.")
     args = p.parse_args()
 
     forced = [e.strip() for e in args.eval_episodes.split(",")] if args.eval_episodes else None
-    build_dataset(args.manifest, args.output, args.eval_split, forced, args.domain_terms)
+    build_dataset(args.manifest, args.output, args.eval_split, forced, args.domain_terms,
+                  args.eval_only_manifest)
 
 
 if __name__ == "__main__":
