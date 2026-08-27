@@ -67,8 +67,13 @@ Round 1 left two artifacts on the volume, and they are the *same weights* stored
 
 | Artifact | What it is | Size |
 |---|---|---|
-| `/model/whisper-urdu-lora-adapter` | the learned delta only | ~60 MB |
+| `/model/whisper-urdu-lora-adapter` | the learned delta only | **222 MB** (10 files) |
 | `/model/whisper-urdu-final` | base with the adapter already **merged in** | 6.17 GB |
+
+⚠️ **Corrected 2026-08-27:** this adapter is **220.1 MB of weights**, not the "~60 MB" quoted in
+round 1's doc and in `CLAUDE.md`. That figure describes the **smoke test's** adapter, which targeted
+`q_proj, v_proj` only. Tier-2 adds `k_proj, out_proj, fc1, fc2`, and the MLP matrices are the large
+ones — hence 3.7×. Measured from the verified backup, not inferred.
 
 **base large-v3 + round-1 adapter IS the round-1 model.** The base weights were frozen throughout
 round 1 — they are the substrate, never the thing trained. So loading `openai/whisper-large-v3` and
@@ -90,8 +95,40 @@ Two valid readings of "train the round-1 model" were considered:
 
 Both start from the round-1 model. (a) was chosen because (b) stacks a second adapter's worth of
 capacity on top — drifting from the "keep r=32" decision — bakes round-1 knowledge into a frozen
-substrate that can no longer be adjusted, loads 6.17 GB instead of 60 MB per cold start, and leaves
+substrate that can no longer be adjusted, loads 6.17 GB instead of 222 MB per cold start, and leaves
 a messier artifact lineage in which the final model depends on shipping the merged r1 model too.
+
+---
+
+## ✅ Round-1 adapter BACKED UP before the run (2026-08-27)
+
+**Why it was needed.** `scripts/push_to_hub.py:19` pushes only `/model/whisper-urdu-final`, so:
+
+| artifact | copies before | copies now |
+|---|---|---|
+| merged model (6.17 GB) | volume + HF Hub ✅ | unchanged |
+| **LoRA adapter (222 MB)** | **volume ONLY** ❌ | volume + local ✅ |
+
+`CLAUDE.md` warns Modal volumes are not permanent, and this is the exact artifact round 2 resumes
+from. Losing it would keep round 1 usable for **inference** (the merged model is safe on the Hub) but
+end the ability to **continue training** from it — LoRA's A/B factors cannot be cleanly recovered from
+a merged model. Not a round-2 risk; a pre-existing one that round 2 made relevant.
+
+`Downloads\Whisper Smoke Test Trained Model\` is the **smoke test's** artifacts, not this run's — so
+the full run's adapter had never been backed up.
+
+**Backed up to** `Downloads\Whisper Round1 Full Run Adapter\whisper-urdu-lora-adapter`
+(10 files, 222.0 MB). Verified: all 10 expected files present, none zero-length,
+`adapter_model.safetensors` 220.1 MB, `adapter_config.json` **byte-identical** to the copy pulled
+independently from the volume (sha256 `8689f3c8…`), and `r=32 / alpha=64 / 6 Tier-2 targets`.
+
+★ **Positive control run, because a healthy-looking backup of the WRONG adapter is the failure that
+would go unnoticed:** compared against the smoke-test copy — `targets=[q_proj, v_proj]`, weights
+60.1 MB, sha256 `fefea31c…` vs the backup's `d47b1539…`. Different artifact, confirmed on weights
+rather than on metadata alone.
+
+⚠️ Still worth doing: `push_to_hub.py` ignores the adapter entirely, so every future round has this
+same single-copy exposure until that script also pushes it.
 
 ---
 
