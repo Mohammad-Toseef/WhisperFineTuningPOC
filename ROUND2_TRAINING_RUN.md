@@ -255,8 +255,8 @@ visible if the two eval sources are reported separately — hence `wer_r1` / `we
 | 1 | ✅ **DONE** `scripts/convert_reviewed_manifest.py` | `^(EP\d+)_(.+)$` → shared `_FOLDER_RE = ^([A-Za-z]+\d+)_(.+)$`; `_ep_num` → `(prefix, number)` | ⛔ was a **hard blocker** — did not match `B3001_…` |
 | 2 | ✅ **DONE** `src/dataset_builder.py` | new **`--eval-only-manifest`** (repeatable) + generic `_ep_num` | ⛔ required for the two-set eval |
 | 3 | ✅ **DONE** `modal_app.py::train` | resume via `PeftModel.from_pretrained(model, adapter, is_trainable=True)`, behind `lora.resume_from_adapter` | ⛔ required |
-| 4 | `modal_app.py::train` | **assert trainable params > 0** after load | ⛔ see trap below |
-| 5 | `modal_app.py` | version output paths so round 1 is never clobbered | ⛔ see volume hygiene |
+| 4 | ✅ **DONE** `modal_app.py::train` | assert trainable params > 0, **plus a `lora_B` non-zero check** that the resumed weights are trained rather than fresh | ⛔ see trap below |
+| 5 | ✅ **DONE** `modal_app.py` | `training.run_tag` versions adapter / merged model / eval_results | ⛔ see volume hygiene |
 | 6 | `modal_app.py::train` | `compute_metrics` reports `wer_r1` / `wer_b3` by slicing the eval order via `eval_buckets.json` | ★ the forgetting tripwire |
 | 7 | `modal_app.py::evaluate` | `--dataset-path` + `--model-path` overrides, **plus per-source reporting** (Set A vs Set B, derived from `eval_buckets.json`'s `episode` field) so one pass per model yields both | ★ needed for the final table; without the split it takes 6 runs instead of 3 |
 | 8 | `modal_app.py::train` | timeout 8 h → 12 h | ★ |
@@ -301,15 +301,52 @@ locally: the drift comparison against the real `adapter_config.json` pulled from
 drift, as expected), two negative controls proving the detector fires, and the presence of
 `is_trainable=True` in the call.
 
-### ⚠️ NEW ORDERING CONSTRAINT — #5 must land before #9
-`ADAPTER_PATH` is `/data/model/whisper-urdu-lora-adapter`, which is *also* where round 1's adapter
-lives. So setting `resume_from_adapter` to it while the trainer still saves there would have the run
-overwrite the adapter it is resuming from, partway through. #3's collision guard now **raises** on
-that, which means the config switch (#9) cannot be turned on until the output paths are versioned
-(#5). Enforced in code rather than left as a note.
+### Status of #4–#5 (built 2026-08-27)
 
-`lora.resume_from_adapter` is deliberately **absent** from `training_config.yaml` for now, so
-current behaviour is unchanged and round 1 remains reproducible.
+**#5** — one knob, `training.run_tag`. Unset reproduces round 1's layout **byte-identically**
+(verified against the three live paths); `run_tag: r2` moves every artifact this run produces:
+
+| artifact | unset (round 1) | `run_tag: r2` |
+|---|---|---|
+| adapter | `/model/whisper-urdu-lora-adapter` | `/model/whisper-urdu-r2-lora-adapter` |
+| merged model | `/model/whisper-urdu-final` | `/model/whisper-urdu-r2-final` |
+| eval results | `/logs/eval_results.json` | `/logs/eval_results-r2.json` |
+
+⚠️ **`eval_results.json` was an unnoticed hazard.** `evaluate()` hardcoded that filename, so a
+round-2 eval would have **overwritten the file holding round 1's 18.57% / 10.50%** — the baseline
+this entire round is measured against, and the one artifact here that cannot be regenerated without
+a GPU pass *and* the model that produced it. It was not in the original change list.
+
+Per-path config keys were the alternative and were rejected: forgetting one is silent, and the one
+most likely to be forgotten — the dataset — clobbers nothing. It just trains round 2 on round 1's
+data and looks like a success. `run_tag` cannot protect a *read* path, so `train()` now warns when a
+tagged run points at the untagged `/processed/dataset`, and prints the **full resolved layout**
+(dataset, resume source, adapter, merged, checkpoints, logs) before loading anything — "which paths
+did that run actually use" is otherwise unanswerable from a finished log.
+
+**#4** — three `raise`s, not warnings, all on the failure modes that otherwise look like success:
+
+1. `trainable == 0` → the adapter loaded **frozen** (the `inference_mode` trap).
+2. no `lora_B` parameters at all → the load did not produce a LoRA model.
+3. ★ **every `lora_B` tensor is zero** → this is a *freshly-initialised* adapter, so round 1's
+   training was never loaded.
+
+Check 3 is the one worth having. A fresh LoRA has `lora_B == 0` in every layer — that is precisely
+why a fresh adapter is a no-op at step 0 — so a trained adapter cannot be all-zero. It therefore
+distinguishes "resumed round 1" from "silently started from scratch", **the one failure mode a
+parameter count and a loss curve look identical under**, and it closes the gap that #3 could not
+verify locally. Gated on `resume_from`, since a fresh adapter is legitimately zero.
+
+### ✅ ORDERING CONSTRAINT RESOLVED — #5 unblocks #9
+`ADAPTER_PATH` is `/data/model/whisper-urdu-lora-adapter`, which is *also* where round 1's adapter
+lives, so resuming from it while the trainer still saved there would have overwritten the source
+adapter partway through the run. #3's collision guard raises on that; **#5 is what clears it** — the
+guard now compares against the *run-scoped* output, so `run_tag: r2` makes resume legal.
+
+`lora.resume_from_adapter` and `training.run_tag` are both still **absent** from
+`training_config.yaml`, so current behaviour is unchanged and round 1 stays reproducible. #9 sets
+them together — and setting `resume_from_adapter` **without** `run_tag` now fails loudly rather than
+destroying round 1's adapter.
 
 ### ⚠️ THE TRAP — `inference_mode: true`
 The round-1 `adapter_config.json` on the volume has `"inference_mode": true`. Loading it with
@@ -326,11 +363,15 @@ Round 1 currently occupies `/model/whisper-urdu-{lora-adapter,final}` and `/proc
 `train()` as written would **overwrite both**: the adapter it is supposed to resume *from*, and
 the dataset holding Set A. Renaming on the volume is avoidable risk, so instead:
 
+✅ **Implemented as `training.run_tag` (change #5).** The table below is what `run_tag: r2` produces;
+leaving it unset reproduces round 1's layout byte-identically.
+
 | Purpose | Path | Access |
 |---|---|---|
 | Round-1 adapter (resume source) | `/model/whisper-urdu-lora-adapter` | **read-only** |
 | Round-1 merged model (eval comparison) | `/model/whisper-urdu-final` | **read-only** |
 | Round-1 dataset (Set A) | `/processed/dataset` | **read-only** |
+| Round-1 eval results (18.57% / 10.50%) | `/logs/eval_results.json` | **read-only** |
 | Round-2 dataset (train + Set A + Set B) | `/processed/dataset_r2` | new |
 | Round-2 adapter | `/model/whisper-urdu-r2-lora-adapter` | new |
 | Round-2 merged model | `/model/whisper-urdu-r2-final` | new |

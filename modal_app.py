@@ -15,9 +15,38 @@ app = modal.App("whisper-urdu-poc")
 volume = modal.Volume.from_name("whisper-training-vol", create_if_missing=True)
 VOLUME_PATH = "/data"
 
-# Model save locations on the volume (shared by train / evaluate / transcribe)
-ADAPTER_PATH = f"{VOLUME_PATH}/model/whisper-urdu-lora-adapter"
-FINAL_MODEL_PATH = f"{VOLUME_PATH}/model/whisper-urdu-final"
+# ── Output path versioning (`training.run_tag`) ─────────────────────
+# Round 1 wrote to the UNTAGGED paths below, and its adapter is round 2's resume
+# SOURCE, so round 2 must not write there: without a tag the trainer would
+# overwrite the adapter it is resuming from, partway through the run, and
+# evaluate() would overwrite the eval_results.json holding round 1's 10.50%.
+#
+# One knob moves every artifact together. Separate per-path config keys were the
+# alternative and were rejected: forgetting one of them is silent, and the one
+# most likely to be forgotten (the dataset) does not clobber anything — it just
+# trains round 2 on round 1's data and looks like a successful run.
+#
+# Unset (`""`) reproduces round 1's layout exactly.
+def _tag(run_tag: str) -> str:
+    return f"-{run_tag}" if run_tag else ""
+
+
+def adapter_path(run_tag: str = "") -> str:
+    return f"{VOLUME_PATH}/model/whisper-urdu{_tag(run_tag)}-lora-adapter"
+
+
+def final_model_path(run_tag: str = "") -> str:
+    return f"{VOLUME_PATH}/model/whisper-urdu{_tag(run_tag)}-final"
+
+
+def eval_results_path(run_tag: str = "") -> str:
+    return f"{VOLUME_PATH}/logs/eval_results{_tag(run_tag)}.json"
+
+
+# Round-1 (untagged) locations. Still the defaults for evaluate/transcribe, and
+# the resume source for round 2.
+ADAPTER_PATH = adapter_path()
+FINAL_MODEL_PATH = final_model_path()
 
 # Container image with all ML dependencies
 image = (
@@ -85,6 +114,30 @@ def train():
     t_cfg = cfg["training"]
     l_cfg = cfg["lora"]
 
+    # ── Resolve where THIS run writes (see run_tag notes at module level) ──
+    run_tag = str(t_cfg.get("run_tag") or "")
+    out_adapter = adapter_path(run_tag)
+    out_final = final_model_path(run_tag)
+
+    # Printed up front, because "which paths did that run actually use" is not
+    # answerable from a finished log otherwise, and every silent failure mode
+    # here is a wrong path rather than a crash.
+    print("📦 Run layout")
+    print(f"   run_tag   : {run_tag or '(none — round-1 layout)'}")
+    print(f"   dataset  <- {cfg['data']['dataset_path']}")
+    print(f"   resume   <- {l_cfg.get('resume_from_adapter') or '(none — fresh adapter)'}")
+    print(f"   adapter  -> {out_adapter}")
+    print(f"   merged   -> {out_final}")
+    print(f"   ckpts    -> {t_cfg['output_dir']}")
+    print(f"   tb logs  -> {t_cfg['logging_dir']}")
+
+    # The dataset is the one path a run_tag cannot protect, because reading the
+    # wrong one destroys nothing and produces a plausible result. Flag the
+    # specific combination that means "tagged run pointed at round 1's data".
+    if run_tag and cfg["data"]["dataset_path"].rstrip("/").endswith("/processed/dataset"):
+        print(f"⚠️  run_tag={run_tag} but dataset_path is the UNTAGGED "
+              f"{cfg['data']['dataset_path']} — is this meant to train on round 1's dataset?")
+
     print(f"🚀 Loading {model_name}...")
     processor = WhisperProcessor.from_pretrained(
         model_name, language=language, task=task
@@ -115,14 +168,14 @@ def train():
                 "train the BASE model instead of continuing round 1, and would look "
                 "like a successful run."
             )
-        # Guard until the output paths are versioned (plan change #5): resuming
-        # from the same path the trainer saves to would destroy round 1's adapter
-        # partway through the run.
-        if os.path.realpath(resume_from) == os.path.realpath(ADAPTER_PATH):
+        # Resuming from the path this run saves to would destroy the source
+        # adapter partway through. Compare against the RUN-SCOPED output, so
+        # setting `training.run_tag` is what clears this.
+        if os.path.realpath(resume_from) == os.path.realpath(out_adapter):
             raise ValueError(
-                f"resume_from_adapter is the SAME path this run saves to ({ADAPTER_PATH}). "
-                "That would overwrite the adapter being resumed from. Point the round-2 "
-                "outputs at their own paths first."
+                f"resume_from_adapter is the SAME path this run saves to ({out_adapter}). "
+                "That would overwrite the adapter being resumed from. Set "
+                "`training.run_tag` (e.g. 'r2') so this run writes to its own paths."
             )
 
         print(f"🔁 RESUMING LoRA adapter from {resume_from}")
@@ -168,6 +221,43 @@ def train():
     # the backward pass has no grad_fn to reach the LoRA adapters.
     model.enable_input_require_grads()
     model.print_trainable_parameters()
+
+    # ── Fail LOUDLY on the two silent no-ops ───────────────────────
+    # Everything that can go wrong above produces a run that looks successful:
+    # a loss curve, a WER per epoch, a saved model. These two checks are the
+    # only thing standing between that and hours of wasted GPU.
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    total = sum(p.numel() for p in model.parameters())
+    if trainable == 0:
+        raise RuntimeError(
+            "0 trainable parameters after LoRA setup — the adapter is FROZEN, so "
+            "training would run to completion and change nothing. A saved "
+            'adapter_config.json carries "inference_mode": true, so a resume needs '
+            "is_trainable=True."
+        )
+    print(f"✅ {trainable:,} trainable / {total:,} total ({100 * trainable / total:.2f}%)")
+
+    if resume_from:
+        # A freshly-initialised LoRA has lora_B == 0 in every layer (which is why
+        # a fresh adapter is a no-op at step 0). Round 1's TRAINED adapter cannot
+        # be all-zero, so this distinguishes "resumed round 1" from "silently
+        # started from scratch" — the one failure mode a parameter count and a
+        # loss curve both look identical under.
+        b_tensors = [p for n, p in model.named_parameters() if "lora_B" in n]
+        nonzero = sum(1 for p in b_tensors if p.detach().abs().sum().item() > 0)
+        if not b_tensors:
+            raise RuntimeError(
+                "resumed an adapter but found no lora_B parameters — the load did not "
+                "produce a LoRA model, so nothing was actually resumed."
+            )
+        if nonzero == 0:
+            raise RuntimeError(
+                f"resumed from {resume_from} but ALL {len(b_tensors)} lora_B tensors are "
+                "zero, i.e. this is a freshly-initialised adapter and round 1's training "
+                "was not loaded. Training would silently start from the base model."
+            )
+        print(f"✅ resume confirmed: {nonzero}/{len(b_tensors)} lora_B tensors carry "
+              f"trained (non-zero) weights")
 
     # ── Data Collator ──────────────────────────────────────────────
     @dataclass
@@ -270,17 +360,17 @@ def train():
     print("🏋️  Starting training...")
     trainer.train()
 
-    print("💾 Saving LoRA adapter to volume...")
-    model.save_pretrained(ADAPTER_PATH)
-    processor.save_pretrained(ADAPTER_PATH)
+    print(f"💾 Saving LoRA adapter to {out_adapter} ...")
+    model.save_pretrained(out_adapter)
+    processor.save_pretrained(out_adapter)
 
     print("🔀 Merging adapter into base model for production format...")
     merged_model = model.merge_and_unload()
-    merged_model.save_pretrained(FINAL_MODEL_PATH)
-    processor.save_pretrained(FINAL_MODEL_PATH)
+    merged_model.save_pretrained(out_final)
+    processor.save_pretrained(out_final)
     volume.commit()
 
-    print(f"✅ Training complete. Model saved to {FINAL_MODEL_PATH}")
+    print(f"✅ Training complete. Model saved to {out_final}")
 
 
 # ── Evaluation (baseline vs fine-tuned WER) ──────────────────────────
@@ -459,10 +549,15 @@ def evaluate(which: str = "both"):
         for k, v in results.items()
     }
     out["n_clips"] = len(eval_ds)
-    with open(f"{VOLUME_PATH}/logs/eval_results.json", "w", encoding="utf-8") as f:
+    # run_tag-scoped: round 1's eval_results.json holds the 18.57% / 10.50%
+    # baseline this project is measured against, and an untagged round-2 eval
+    # would overwrite it. It is also the one artifact here that cannot be
+    # regenerated cheaply — it needs a GPU pass and the model that produced it.
+    results_file = eval_results_path(str(cfg["training"].get("run_tag") or ""))
+    with open(results_file, "w", encoding="utf-8") as f:
         json.dump(out, f, ensure_ascii=False, indent=2)
     volume.commit()
-    print(f"💾 Results saved to {VOLUME_PATH}/logs/eval_results.json")
+    print(f"💾 Results saved to {results_file}")
     return out
 
 
