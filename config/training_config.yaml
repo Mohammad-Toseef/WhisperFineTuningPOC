@@ -4,6 +4,15 @@ model:
   task: "transcribe"
 
 lora:
+  # ── ROUND 2: continue round 1's adapter, do NOT build a fresh one ──
+  # base large-v3 + this adapter IS the round-1 model (the base was frozen all
+  # through round 1), so step 0 reproduces round 1's outputs exactly.
+  # Unset this to go back to round 1's behaviour (a fresh adapter on the base).
+  # NOTE: when set, r / lora_alpha / target_modules below are NOT used to build
+  # the adapter — they come from the adapter's own adapter_config.json. They are
+  # still read, and a mismatch is reported, because the values that actually
+  # train are the adapter's.
+  resume_from_adapter: "/data/model/whisper-urdu-lora-adapter"
   r: 32
   lora_alpha: 64
   # Tier 2 (full run): attention (q/k/v/out) + MLP (fc1/fc2). The MLP targets are
@@ -22,36 +31,74 @@ audio:
   min_duration_seconds: 1
 
 training:
-  output_dir: "/data/checkpoints/whisper-large-v3-urdu"
+  # ── run_tag: versions EVERY artifact this run produces ──
+  # Round 1 wrote to the untagged paths and its adapter is this run's resume
+  # SOURCE, so without a tag the trainer would overwrite the adapter it is
+  # resuming from, and evaluate() would overwrite the eval_results.json holding
+  # round 1's 18.57% / 10.50%. Empty/unset reproduces round 1's layout.
+  #   adapter -> /data/model/whisper-urdu-r2-lora-adapter
+  #   merged  -> /data/model/whisper-urdu-r2-final
+  #   eval    -> /data/logs/eval_results-r2-*.json
+  run_tag: "r2"
+
+  # Tagged so round 1's checkpoints/logs are not mixed into this run's.
+  output_dir: "/data/checkpoints/whisper-large-v3-urdu-r2"   # r1: .../whisper-large-v3-urdu
+  logging_dir: "/data/logs/r2"                               # r1: /data/logs
+
   per_device_train_batch_size: 8   # large-v3 on A10G 24GB; drop to 4 if OOM
   per_device_eval_batch_size: 4
   gradient_accumulation_steps: 4   # Effective batch = 32
-  learning_rate: 1.0e-5
-  warmup_steps: 57   # ~10% of max_steps (49-ep run)
-  # Step-based (no num_train_epochs). RECOMPUTE for the 49-episode run once the
-  # dataset_builder prints the train-clip count:
-  #   steps_per_epoch = ceil(n_train_clips / 32)   # eff-batch = 8 * 4
-  #   max_steps       = steps_per_epoch * 8..10     # target 8-10 epochs
-  # Also scale warmup_steps (~10% of max_steps) and eval/save_steps below.
-  # Smoke test was 535 clips -> ~15 steps/epoch -> 120 steps (~8 epochs).
-  # 49-ep run (2026-07-25): 2011 train clips -> ceil(2011/32)=63 steps/epoch -> 567 (~9 epochs).
-  max_steps: 567
+
+  # ── learning_rate: HALVED from round 1's 1.0e-5 ──
+  # Round 1 started from scratch, so there was nothing to preserve and large
+  # updates were free. Round 2 starts from a model that already knows this
+  # domain, and large updates can OVERWRITE that — the forgetting risk. 5.0e-6
+  # trades some speed at learning Batch 3's code-switching for keeping round 1's
+  # spiritual_term result (9.38%).
+  # This is a judgement call, and it is FALSIFIABLE at epoch 1: watch
+  # `eval_wer_r1` (change #6). If it has climbed well above 10.50%, the rate is
+  # too high — stop, lower it, restart. That costs ~1.5 h, not the run.
+  learning_rate: 5.0e-6
+
+  # ── Step schedule (step-based; no num_train_epochs) ──
+  #   steps_per_epoch = ceil(n_train_clips / 32)      # eff-batch = 8 * 4
+  #   max_steps       = steps_per_epoch * n_epochs
+  # History: smoke test 535 clips -> ~15/epoch -> 120 (~8 ep).
+  #          49-ep run 2011 clips -> 63/epoch -> 567 (~9 ep); BEST WAS EPOCH 6,
+  #          and 7-9 were slightly worse — the overfitting curve made visible.
+  # ROUND 2: 8256 train clips -> ceil(8256/32) = 258/epoch -> 774 (3 epochs).
+  # Fewer epochs than round 1 on purpose: this starts from a trained model AND
+  # has ~4x the data, so one epoch here teaches far more than one epoch there.
+  max_steps: 774
+  warmup_steps: 77   # ~10% of max_steps — small updates first so the opening
+                     # steps cannot jolt the resumed adapter
+
   gradient_checkpointing: true
   fp16: true
   evaluation_strategy: "steps"
-  eval_steps: 63   # once per epoch (9 evals over the run)
-  save_steps: 63
+  # Once per epoch => 3 evals. save_steps must stay a multiple of eval_steps or
+  # load_best_model_at_end cannot find the best checkpoint.
+  eval_steps: 258
+  save_steps: 258
   save_total_limit: 3
   load_best_model_at_end: true
+  # The BLENDED wer, deliberately: the eval split spans two corpora and a
+  # checkpoint should be good at both. `wer_r1` / `wer_b3` are reported
+  # alongside it for reading, not for selection.
   metric_for_best_model: "wer"
   greater_is_better: false
   predict_with_generate: true
   generation_max_length: 225
   logging_steps: 25
   report_to: "tensorboard"
-  logging_dir: "/data/logs"
 
 data:
+  # Vestigial: dataset_builder does the splitting (whole-episode holdout) and
+  # writes both splits to disk. Kept so older configs still parse.
   train_split: 0.90
   eval_split: 0.10
-  dataset_path: "/data/processed/dataset"
+  # Round 2's dataset: Batch 3 train + a combined (Set B + Set A) eval split.
+  # MUST be the tagged path — pointing at round 1's /processed/dataset destroys
+  # nothing and produces a plausible result, which is the one silent failure a
+  # run_tag cannot catch. train() warns if this looks untagged.
+  dataset_path: "/data/processed/dataset_r2"                  # r1: /data/processed/dataset

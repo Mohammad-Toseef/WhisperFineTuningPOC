@@ -260,7 +260,7 @@ visible if the two eval sources are reported separately — hence `wer_r1` / `we
 | 6 | ✅ **DONE** `modal_app.py::train` | `compute_metrics` reports `wer_r1` / `wer_b3` alongside the blended `wer` | ★ the forgetting tripwire |
 | 7 | ✅ **DONE** `modal_app.py::evaluate` | `--dataset-path` + `--model-path`, **per-source and source×bucket reporting** | ★ needed for the final table; without it, 6 runs instead of 3 |
 | 8 | ✅ **DONE** `modal_app.py::train` | timeout 8 h → 12 h | ★ |
-| 9 | `config/training_config.yaml` | steps/warmup/eval_steps/LR per the table above; new `lora.resume_from_adapter` key | ★ |
+| 9 | ✅ **DONE** `config/training_config.yaml` | `run_tag: r2`, `resume_from_adapter`, `dataset_path`, 774 steps / 3 epochs, LR 5.0e-6 | ★ the switch that turns round 2 on |
 
 ### Status of #1–#3 (built 2026-08-27)
 
@@ -385,7 +385,53 @@ one). The rationale is recorded beside it: the overrun is *total*, not partial �
 merged model and the only `volume.commit()` all happen after training, and nothing commits during
 it. Modal bills time used, not the ceiling, so the margin is free.
 
-### ✅ ORDERING CONSTRAINT RESOLVED — #5 unblocks #9
+### Status of #9 (built 2026-08-27) — ALL 9 CHANGES DONE
+
+`config/training_config.yaml` is the switch: every earlier change added capability that stayed inert
+until this file turned it on. **Decisions taken: 3 epochs, LR 5.0e-6.**
+
+| setting | round 1 | **round 2** |
+|---|---|---|
+| `run_tag` | — | **`r2`** |
+| `lora.resume_from_adapter` | — | `/data/model/whisper-urdu-lora-adapter` |
+| `data.dataset_path` | `/processed/dataset` | `/processed/dataset_r2` |
+| `learning_rate` | 1.0e-5 | **5.0e-6** |
+| `max_steps` | 567 (~9 ep) | **774 (3 ep × 258)** |
+| `warmup_steps` | 57 | **77** (9.9%) |
+| `eval_steps` / `save_steps` | 63 / 63 | **258 / 258** (3 evals) |
+| `output_dir` | `…/whisper-large-v3-urdu` | `…/whisper-large-v3-urdu-r2` |
+| `logging_dir` | `/data/logs` | `/data/logs/r2` |
+
+**The step arithmetic is verified against the real manifest, not assumed:** Batch 3 minus Set B is
+**8,256** train clips, effective batch 8×4 = 32, so `ceil(8256/32) = 258` steps/epoch and 774 is
+exactly 3 epochs. `save_steps % eval_steps == 0`, so `load_best_model_at_end` can find the best
+checkpoint.
+
+**LR rationale.** Round 1 started from scratch — nothing to preserve, so large updates were free.
+Round 2 starts from a model that already knows this domain, and large updates can *overwrite* that.
+Crucially this is now **falsifiable at epoch 1**: watch `eval_wer_r1` (change #6). If it has climbed
+well above 10.50%, the rate is too high — stop, lower it, restart, having spent ~1.5 h rather than
+the run. That is what made a conservative default cheap to choose and cheap to be wrong about.
+
+⚠️ **`5.0e-6`, not `5e-6`.** YAML parses the first as a float and the second as the **string**
+`"5e-6"`, which would reach the optimizer as a string. Asserted as a float in the test.
+
+### 🐞 #9 EXPOSED A COLLISION — the three eval runs shared one filename
+Setting `run_tag: r2` made all three planned eval runs write `eval_results-r2.json`, so runs 1 and 2
+would have been **silently clobbered by run 3** — losing exactly the comparison baselines the round
+is judged against, including the r1-on-Set-B number that does not otherwise exist. Fixed by deriving
+a label from what was scored:
+
+```
+r1 control + missing Set B baseline -> eval_results-r2-whisper-urdu-final.json
+secondary anchor (base)             -> eval_results-r2-base.json
+the result (round 2)                -> eval_results-r2-whisper-urdu-r2-final.json
+```
+
+Derived automatically rather than left to operator discipline, and round 1's `eval_results.json` is
+never written again.
+
+### ✅ ORDERING CONSTRAINT RESOLVED — #5 unblocked #9
 `ADAPTER_PATH` is `/data/model/whisper-urdu-lora-adapter`, which is *also* where round 1's adapter
 lives, so resuming from it while the trainer still saved there would have overwritten the source
 adapter partway through the run. #3's collision guard raises on that; **#5 is what clears it** — the
@@ -457,15 +503,17 @@ modal volume put whisper-training-vol ./config /config --force
 # 4. Train — DETACHED (round 1's first attempt died at step 88 on a local network drop)
 modal run --detach modal_app.py::train
 
-# 5. Evaluate  (needs fix #7). THREE runs, not six: dataset_r2's eval split already
-#    holds Set A + Set B, so one pass per model yields BOTH, split by source.
-#    Run the r1 control FIRST — it validates the harness before any new number is trusted.
-modal run modal_app.py::evaluate --dataset-path /data/processed/dataset_r2 `
-  --model-path /data/model/whisper-urdu-final        # r1: Set A must reproduce 10.50%
-modal run modal_app.py::evaluate --dataset-path /data/processed/dataset_r2 --which base
-                                                     # base: Set A should reproduce 18.57%
-modal run modal_app.py::evaluate --dataset-path /data/processed/dataset_r2 `
-  --model-path /data/model/whisper-urdu-r2-final     # r2: the result
+# 5. Evaluate. THREE runs, not six: dataset_r2's eval split already holds
+#    Set A + Set B, so one pass per model yields BOTH, split by source.
+#    Run the r1 control FIRST — it validates the harness before any new number
+#    is trusted, and supplies the r1-on-Set-B baseline that does not yet exist.
+#    --dataset-path is optional now (config points at dataset_r2) but passing it
+#    makes each run self-describing in the saved results.
+modal run modal_app.py::evaluate --which finetuned `
+  --model-path /data/model/whisper-urdu-final        # r1 — Set A must reproduce 10.50%
+modal run modal_app.py::evaluate --which base        # base — Set A should reproduce 18.57%
+modal run modal_app.py::evaluate --which finetuned `
+  --model-path /data/model/whisper-urdu-r2-final     # r2 — the result
 
 # 6. Push to HF Hub immediately (volumes are not permanent)
 modal run --detach scripts/push_to_hub.py

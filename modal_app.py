@@ -39,8 +39,17 @@ def final_model_path(run_tag: str = "") -> str:
     return f"{VOLUME_PATH}/model/whisper-urdu{_tag(run_tag)}-final"
 
 
-def eval_results_path(run_tag: str = "") -> str:
-    return f"{VOLUME_PATH}/logs/eval_results{_tag(run_tag)}.json"
+def eval_results_path(run_tag: str = "", label: str = "") -> str:
+    """Where evaluate() writes its results.
+
+    `label` identifies WHICH models were scored. Round 2 runs evaluate three
+    times over one dataset (round 1, base, round 2) and every run would otherwise
+    write the same filename, so runs 1 and 2 would be silently clobbered by run
+    3 — losing the comparison baselines the round is judged against. Derived
+    automatically rather than left to the operator to remember.
+    """
+    name = f"eval_results{_tag(run_tag)}{_tag(label)}"
+    return f"{VOLUME_PATH}/logs/{name}.json"
 
 
 # Round-1 (untagged) locations. Still the defaults for evaluate/transcribe, and
@@ -712,7 +721,15 @@ def evaluate(which: str = "both", dataset_path: str = "", model_path: str = ""):
     # baseline this project is measured against, and an untagged round-2 eval
     # would overwrite it. It is also the one artifact here that cannot be
     # regenerated cheaply — it needs a GPU pass and the model that produced it.
-    results_file = eval_results_path(str(cfg["training"].get("run_tag") or ""))
+    # The label additionally separates the three round-2 eval runs from each
+    # other; without it they all write one filename and only the last survives.
+    if which == "base":
+        label = "base"
+    elif which == "finetuned":
+        label = os.path.basename(ft_path.rstrip("/"))
+    else:
+        label = f"base-vs-{os.path.basename(ft_path.rstrip('/'))}"
+    results_file = eval_results_path(str(cfg["training"].get("run_tag") or ""), label)
     with open(results_file, "w", encoding="utf-8") as f:
         json.dump(out, f, ensure_ascii=False, indent=2)
     volume.commit()
