@@ -52,6 +52,19 @@ def eval_results_path(run_tag: str = "", label: str = "") -> str:
     return f"{VOLUME_PATH}/logs/{name}.json"
 
 
+def eval_predictions_path(run_tag: str = "", label: str = "") -> str:
+    """Per-clip predictions, written BESIDE the scores rather than inside them.
+
+    A separate file on purpose: the scores file is small enough to read by eye or
+    grep, and burying ~600 transcripts in it would end that. Keeping them at all
+    means later questions — rescoring under a different normalizer, finding which
+    clips got worse, reading B3039's English (success criterion 4) — cost nothing
+    instead of another GPU pass.
+    """
+    name = f"eval_predictions{_tag(run_tag)}{_tag(label)}"
+    return f"{VOLUME_PATH}/logs/{name}.json"
+
+
 # Round-1 (untagged) locations. Still the defaults for evaluate/transcribe, and
 # the resume source for round 2.
 ADAPTER_PATH = adapter_path()
@@ -520,6 +533,11 @@ def evaluate(which: str = "both", dataset_path: str = "", model_path: str = ""):
     bucket_indices: dict[str, list[int]] = {}
     source_indices: dict[str, list[int]] = {}
     source_bucket_indices: dict[str, list[int]] = {}
+    # Initialised empty so the predictions sidecar below can be written even when
+    # eval_buckets.json is missing or misaligned — it just loses the per-clip
+    # episode/source/bucket labels rather than raising NameError at the very end,
+    # after the GPU work is already paid for.
+    bmeta: list[dict] = []
     sidecar = os.path.join(ds_path, "eval_buckets.json")
     if os.path.exists(sidecar):
         with open(sidecar, encoding="utf-8") as f:
@@ -732,8 +750,36 @@ def evaluate(which: str = "both", dataset_path: str = "", model_path: str = ""):
     results_file = eval_results_path(str(cfg["training"].get("run_tag") or ""), label)
     with open(results_file, "w", encoding="utf-8") as f:
         json.dump(out, f, ensure_ascii=False, indent=2)
+
+    # ── Per-clip predictions sidecar ───────────────────────────────
+    # One row per clip with every model's output side by side, so base/r1/r2 can
+    # be diffed directly and criterion 4 (does B3039 come out in English?) can be
+    # read straight from a file instead of costing another transcription run.
+    aligned = len(bmeta) == len(references)
+    clips = []
+    for i, ref in enumerate(references):
+        row = {"i": i, "reference": ref}
+        if aligned:
+            m = bmeta[i]
+            row["episode"] = m.get("episode")
+            row["source"] = m.get("source")
+            row["buckets"] = m.get("buckets")
+        for key in ("base", "finetuned"):
+            if key in results:
+                row[key] = results[key]["predictions"][i]
+        clips.append(row)
+    predictions_file = eval_predictions_path(
+        str(cfg["training"].get("run_tag") or ""), label)
+    with open(predictions_file, "w", encoding="utf-8") as f:
+        json.dump({"dataset_path": ds_path, "which": which,
+                   "models": {k: results[k]["model_path"] for k in results},
+                   "labels_aligned": aligned, "clips": clips},
+                  f, ensure_ascii=False, indent=2)
+
     volume.commit()
     print(f"💾 Results saved to {results_file}")
+    print(f"💾 Per-clip predictions saved to {predictions_file}"
+          f"{'' if aligned else '   (WITHOUT episode/source labels — sidecar misaligned)'}")
     return out
 
 

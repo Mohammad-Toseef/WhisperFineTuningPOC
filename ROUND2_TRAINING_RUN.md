@@ -582,6 +582,81 @@ what needs fixing, and that is far better learned before the round-2 numbers arr
 
 ---
 
+## ★ Split shares, and why the eval size is a ONE-WAY decision
+
+### How Batch 3 divides
+| | clips | share | hours | episodes |
+|---|---|---|---|---|
+| **Train** | 8,256 | **96.0%** | 40.75 | 90 |
+| **Eval (Set B)** | 341 | **4.0%** | 1.73 | 6 |
+
+The eval split itself is larger than Batch 3's 4%, because round 1's episodes join it:
+**Set B 341 (58.1%) + Set A 246 (41.9%) = 587 clips.** Round 1's episodes are 42% of what is
+evaluated and 0% of what is trained.
+
+Round 1 held out **10.9%** of its corpus; round 2 holds out **4.0%**. That is the same decision
+against a bigger corpus, not a loss of rigour — what an eval set needs is absolute size, and Set B
+(341) is larger than round 1's entire eval set (246), with `code_switch` at 132 vs round 1's 52.
+Round 1 had to spend 10.9% to reach a usable size because its corpus was small.
+
+### ⚠️ The clean holdout is ALREADY EXHAUSTED — 587 clips is all there is
+An eval set only means anything on clips the model never trained on. For the **round-2** model:
+
+| data | clips | clean? |
+|---|---|---|
+| Batch 3 — Set B (6 eps) | 341 | ✅ never trained on |
+| Round 1 — Set A (7 pinned eps) | 246 | ✅ never trained on, round 1 *or* 2 |
+| Batch 3 — the 90 train episodes | 8,256 | ❌ trained on in round 2 |
+| Round 1 — its other 42 episodes | 2,011 | ❌ **trained on in ROUND 1** |
+
+That last row is the easy one to miss: round 2 does not train on round-1 data, but it **inherits
+round 1's adapter**, and round 1 trained on those 42 episodes. The learning is in the weights, so
+they are contaminated for the round-2 model too.
+
+**Consequence: the eval set cannot be enlarged after training.** There is no uncontaminated labelled
+data left. (The 4,000 unlabelled videos support eyeball comparison — as round 1 did with
+`compare_transcribe.py` — but not WER, having no references.)
+
+### The asymmetry to decide on
+**Holding data out is reversible; training on it is not.**
+- Hold out 8% and not need it → nothing lost, that data can train in a future round 3.
+- Train on it now → permanently unusable as eval for this model. No later decision undoes it.
+
+Decision taken: **keep 4%**, because 341 clips is not inadequate and every bucket a criterion
+depends on is well populated. Recorded as a **one-way** choice, not a low-stakes one.
+
+⚠️ **Set B is concentrated**: episode sizes are `23, 29, 44, 44, 47, 154`, so **B3039 alone is 45% of
+Set B** (its episodes average 56.8 clips vs Batch 3's 89.6 — 63% of typical, which is why the episode
+share 6.2% exceeds the clip share 4.0%). Checked, and it touches no criterion: retention is measured
+on Set A; `code_switch` draws only ~23% of its 132 clips from B3039; and Set B's *overall* WER was
+never meant to be read as a headline. Would have been a defect if the code_switch bucket were
+concentrated too — it is not.
+
+---
+
+## Per-clip predictions are kept (added 2026-08-27)
+`evaluate()` computed per-clip predictions and then **discarded** them, so any later question cost a
+fresh GPU pass. They are now written to a **separate** sidecar,
+`/logs/eval_predictions-<run_tag>-<label>.json`, one row per clip carrying `reference`, `episode`,
+`source`, `buckets`, and **each model's output side by side** — so base/r1/r2 diff directly, and
+**criterion 4 (does B3039 come out in English?) is readable straight from a file** instead of needing
+a separate transcription run.
+
+Separate file rather than inside the scores: the scores file is small enough to read or grep by eye,
+and burying ~600 transcripts in it would end that.
+
+✅ **Confirmed not to affect training** (asserted in the test, not assumed): `evaluate` is a distinct
+`@app.function` from `train`, loads models under `torch.no_grad()`, never writes weights, writes to
+different volume paths, and needed no config change. `eval_predictions_path` /`eval_results_path` are
+referenced only inside `evaluate`. Note `train()`'s `pred.predictions` is HuggingFace's
+`EvalPrediction` attribute — the same name, an unrelated thing, untouched.
+
+Degrades rather than raising: with a missing or misaligned `eval_buckets.json` the predictions are
+still written, minus the per-clip labels. `bmeta` is initialised empty specifically so this cannot
+`NameError` at the very end, *after* the GPU time is already spent.
+
+---
+
 ## Success criteria (set BEFORE the run, so the result cannot be rationalised)
 
 All four are framed against **round 1**, not base — round 1 is the primary baseline (see above).
