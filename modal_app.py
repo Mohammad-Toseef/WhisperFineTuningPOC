@@ -378,6 +378,21 @@ def train():
 
     # ── Metrics ────────────────────────────────────────────────────
     wer_metric = evaluate.load("wer")
+    # CER alongside WER because the PRIMARY goal of this round is Urdu spelling
+    # accuracy, and WER is binary per word: a word missing one diacritic scores
+    # exactly the same as a completely wrong word. CER counts characters, so it
+    # shows the magnitude and can tell "nearly right" from "wrong".
+    #
+    # Loaded defensively on purpose. This is a reporting metric, and the failure
+    # it could cause — an exception at the first eval, ~90 minutes into a ~6 h run
+    # — costs far more than the number is worth. Same reasoning as the Binarize
+    # catch in modal_align.py.
+    try:
+        cer_metric = evaluate.load("cer")
+    except Exception as exc:
+        cer_metric = None
+        print(f"⚠️  CER metric unavailable ({type(exc).__name__}: {exc}) — "
+              "training continues, reporting WER only.")
 
     def compute_metrics(pred):
         pred_ids = pred.predictions
@@ -385,19 +400,23 @@ def train():
         label_ids[label_ids == -100] = processor.tokenizer.pad_token_id
         pred_str = processor.batch_decode(pred_ids, skip_special_tokens=True)
         label_str = processor.batch_decode(label_ids, skip_special_tokens=True)
-        wer = 100 * wer_metric.compute(predictions=pred_str, references=label_str)
-        metrics = {"wer": wer}
-        # Per-corpus WER alongside the blend. `metric_for_best_model` stays on the
-        # blended `wer` on purpose — a checkpoint should be good at BOTH — these
-        # only make the blend's composition visible. Costs no extra GPU: the
-        # predictions already exist, this slices them by index.
+        def score(preds, refs) -> dict:
+            out = {"wer": 100 * wer_metric.compute(predictions=preds, references=refs)}
+            if cer_metric is not None:
+                out["cer"] = 100 * cer_metric.compute(predictions=preds, references=refs)
+            return out
+
+        metrics = score(pred_str, label_str)
+        # Per-corpus scores alongside the blend. `metric_for_best_model` stays on
+        # the blended `wer` on purpose — a checkpoint should be good at BOTH —
+        # these only make the blend's composition visible. Costs no extra GPU:
+        # the predictions already exist, this slices them by index.
         for key, idxs in eval_src_idx.items():
             if not idxs:
                 continue
-            metrics[f"wer_{key}"] = 100 * wer_metric.compute(
-                predictions=[pred_str[i] for i in idxs],
-                references=[label_str[i] for i in idxs],
-            )
+            for name, val in score([pred_str[i] for i in idxs],
+                                   [label_str[i] for i in idxs]).items():
+                metrics[f"{name}_{key}"] = val
         return metrics
 
     # ── Training Arguments ─────────────────────────────────────────
@@ -573,6 +592,16 @@ def evaluate(which: str = "both", dataset_path: str = "", model_path: str = ""):
         print("ℹ️  No eval_buckets.json found — reporting overall WER only.")
 
     wer_metric = hf_evaluate.load("wer")
+    # CER: the instrument for SPELLING accuracy, this round's primary goal. WER is
+    # binary per word — one wrong diacritic scores the same as a wholly wrong word
+    # — so it cannot show whether spelling improved, only whether words changed.
+    # Degrades rather than failing: WER alone still beats losing the whole run.
+    try:
+        cer_metric = hf_evaluate.load("cer")
+    except Exception as exc:
+        cer_metric = None
+        print(f"⚠️  CER metric unavailable ({type(exc).__name__}: {exc}) — WER only. "
+              "Spelling quality will be much harder to read.")
 
     # WER text normalizer — applied EQUALLY to base & fine-tuned so the
     # comparison is fair. Strips punctuation (Urdu + Latin) and collapses
@@ -615,30 +644,36 @@ def evaluate(which: str = "both", dataset_path: str = "", model_path: str = ""):
             )
             print(f"   {min(i + batch_size, len(eval_ds))}/{len(eval_ds)} clips")
 
+        npreds = [normalize(p) for p in preds]
+        nrefs = [normalize(r) for r in references]
         raw_wer = 100 * wer_metric.compute(predictions=preds, references=references)
-        norm_wer = 100 * wer_metric.compute(
-            predictions=[normalize(p) for p in preds],
-            references=[normalize(r) for r in references],
-        )
-        # Normalized WER over an arbitrary index subset.
-        def subset_wer(idxs: list[int]) -> dict:
-            return {
-                "n": len(idxs),
-                "norm_wer": 100 * wer_metric.compute(
-                    predictions=[normalize(preds[i]) for i in idxs],
-                    references=[normalize(references[i]) for i in idxs],
-                ),
-            }
+        norm_wer = 100 * wer_metric.compute(predictions=npreds, references=nrefs)
+        raw_cer = norm_cer = None
+        if cer_metric is not None:
+            raw_cer = 100 * cer_metric.compute(predictions=preds, references=references)
+            norm_cer = 100 * cer_metric.compute(predictions=npreds, references=nrefs)
 
-        buckets_wer = {b: subset_wer(i) for b, i in bucket_indices.items() if i}
-        sources_wer = {s: subset_wer(i) for s, i in source_indices.items() if i}
-        source_buckets_wer = {k: subset_wer(i) for k, i in source_bucket_indices.items() if i}
+        # Normalized WER + CER over an arbitrary index subset.
+        def subset_scores(idxs: list[int]) -> dict:
+            p = [npreds[i] for i in idxs]
+            r = [nrefs[i] for i in idxs]
+            out = {"n": len(idxs),
+                   "norm_wer": 100 * wer_metric.compute(predictions=p, references=r)}
+            if cer_metric is not None:
+                out["norm_cer"] = 100 * cer_metric.compute(predictions=p, references=r)
+            return out
+
+        buckets_wer = {b: subset_scores(i) for b, i in bucket_indices.items() if i}
+        sources_wer = {s: subset_scores(i) for s, i in source_indices.items() if i}
+        source_buckets_wer = {k: subset_scores(i) for k, i in source_bucket_indices.items() if i}
 
         del model
         torch.cuda.empty_cache()
-        print(f"   → {label}: raw WER {raw_wer:.2f}% | normalized WER {norm_wer:.2f}%")
+        cer_txt = f" | norm CER {norm_cer:.2f}%" if norm_cer is not None else ""
+        print(f"   → {label}: raw WER {raw_wer:.2f}% | normalized WER {norm_wer:.2f}%{cer_txt}")
         return {"label": label, "model_path": path,
                 "raw_wer": raw_wer, "norm_wer": norm_wer,
+                "raw_cer": raw_cer, "norm_cer": norm_cer,
                 "buckets": buckets_wer, "sources": sources_wer,
                 "source_buckets": source_buckets_wer, "predictions": preds}
 
@@ -661,66 +696,71 @@ def evaluate(which: str = "both", dataset_path: str = "", model_path: str = ""):
     for key in ("base", "finetuned"):
         if key in results:
             r = results[key]
-            print(f"  {r['label']:<32} raw {r['raw_wer']:6.2f}%  |  norm {r['norm_wer']:6.2f}%")
+            cer = f"  |  CER {r['norm_cer']:6.2f}%" if r.get("norm_cer") is not None else ""
+            print(f"  {r['label']:<32} raw WER {r['raw_wer']:6.2f}%  |  "
+                  f"WER {r['norm_wer']:6.2f}%{cer}")
     if "base" in results and "finetuned" in results:
-        delta = results["base"]["norm_wer"] - results["finetuned"]["norm_wer"]
         print("-" * 60)
-        print(f"  Improvement (normalized WER):   {delta:+.2f} points")
+        d_wer = results["base"]["norm_wer"] - results["finetuned"]["norm_wer"]
+        print(f"  Improvement, normalized WER:   {d_wer:+.2f} points")
+        if results["base"].get("norm_cer") is not None and results["finetuned"].get("norm_cer") is not None:
+            d_cer = results["base"]["norm_cer"] - results["finetuned"]["norm_cer"]
+            print(f"  Improvement, normalized CER:   {d_cer:+.2f} points   "
+                  "<- the SPELLING signal")
     print("=" * 60)
 
-    # ── Per-bucket breakdown (this is where domain-term gains show up) ──
-    if bucket_indices:
-        print("\n  PER-BUCKET normalized WER")
-        print(f"  {'bucket':<16}{'n':>6}{'base':>10}{'finetuned':>12}{'delta':>9}")
-        print("-" * 53)
-        for b in BUCKETS:
-            base_b = results.get("base", {}).get("buckets", {}).get(b)
-            ft_b = results.get("finetuned", {}).get("buckets", {}).get(b)
-            n = (base_b or ft_b or {}).get("n")
-            if n is None:
-                continue
-            base_w = base_b["norm_wer"] if base_b else None
-            ft_w = ft_b["norm_wer"] if ft_b else None
-            base_s = f"{base_w:.2f}" if base_w is not None else "-"
-            ft_s = f"{ft_w:.2f}" if ft_w is not None else "-"
-            delta_s = f"{base_w - ft_w:+.2f}" if (base_w is not None and ft_w is not None) else "-"
-            print(f"  {b:<16}{n:>6}{base_s:>10}{ft_s:>12}{delta_s:>9}")
-        if source_indices:
-            print("  ⚠️  These span BOTH corpora — see the per-source tables below. A"
-                  "\n      bucket averaged across two corpora is not a comparison.")
-        print("=" * 60)
+    # ── Subset tables: WER and CER side by side ────────────────────
+    # One helper for all three tables. The bucket table used to have its own copy
+    # of this formatting, which is how it would have quietly kept reporting WER
+    # only after CER was added everywhere else.
+    HDR = (f"  {'subset':<22}{'n':>6}{'WER base':>10}{'WER ft':>9}{'ΔWER':>8}"
+           f"{'CER base':>11}{'CER ft':>9}{'ΔCER':>8}")
 
-    # ── Per-source breakdown (round 2: Set A retention vs Set B gain) ──
     def _row(label: str, key: str, getter: str) -> None:
         base_x = results.get("base", {}).get(getter, {}).get(key)
         ft_x = results.get("finetuned", {}).get(getter, {}).get(key)
         n = (base_x or ft_x or {}).get("n")
         if n is None:
             return
-        bw = base_x["norm_wer"] if base_x else None
-        fw = ft_x["norm_wer"] if ft_x else None
-        bs = f"{bw:.2f}" if bw is not None else "-"
-        fs = f"{fw:.2f}" if fw is not None else "-"
-        ds = f"{bw - fw:+.2f}" if (bw is not None and fw is not None) else "-"
-        print(f"  {label:<22}{n:>6}{bs:>10}{fs:>12}{ds:>9}")
+        cells = [f"  {label:<22}", f"{n:>6}"]
+        for metric, widths in (("norm_wer", (10, 9, 8)), ("norm_cer", (11, 9, 8))):
+            bv = base_x.get(metric) if base_x else None
+            fv = ft_x.get(metric) if ft_x else None
+            cells.append(f"{bv:>{widths[0]}.2f}" if bv is not None else f"{'-':>{widths[0]}}")
+            cells.append(f"{fv:>{widths[1]}.2f}" if fv is not None else f"{'-':>{widths[1]}}")
+            cells.append(f"{bv - fv:>+{widths[2]}.2f}" if (bv is not None and fv is not None)
+                         else f"{'-':>{widths[2]}}")
+        print("".join(cells))
+
+    if bucket_indices:
+        print("\n  PER-BUCKET  (nastaliq_only is the PRIMARY goal: Urdu spelling)")
+        print(HDR)
+        print("-" * 84)
+        for b in BUCKETS:
+            _row(b, b, "buckets")
+        if source_indices:
+            print("  ⚠️  These span BOTH corpora — see the per-source tables below. A"
+                  "\n      bucket averaged across two corpora is not a comparison.")
+        print("=" * 84)
 
     if source_indices:
-        print("\n  PER-SOURCE normalized WER  (never average these together)")
-        print(f"  {'source':<22}{'n':>6}{'base':>10}{'finetuned':>12}{'delta':>9}")
-        print("-" * 59)
+        print("\n  PER-SOURCE  (never average these together)")
+        print(HDR)
+        print("-" * 84)
         for s in sorted(source_indices):
             _row(f"{s}  ({'round 1' if s == 'r1' else 'this batch'})", s, "sources")
-        print("=" * 60)
+        print("=" * 84)
 
-        print("\n  SOURCE x BUCKET normalized WER")
-        print("  This is the table the success criteria are read from: r1/* is")
-        print("  retention (criteria 1-2), b3/code_switch is the gain (criterion 3).")
-        print(f"  {'source / bucket':<22}{'n':>6}{'base':>10}{'finetuned':>12}{'delta':>9}")
-        print("-" * 59)
+        print("\n  SOURCE x BUCKET — the table the success criteria are read from")
+        print("    b3/nastaliq_only  = criterion 1, Urdu improves (PRIMARY)")
+        print("    r1/*              = criteria 2-3, nothing regressed")
+        print("    b3/code_switch    = criterion 4, code-switching improves")
+        print(HDR)
+        print("-" * 84)
         for s in sorted(source_indices):
             for b in BUCKETS:
                 _row(f"{s} / {b}", f"{s}/{b}", "source_buckets")
-        print("=" * 60)
+        print("=" * 84)
 
     # Persist results to the volume for later reference
     os.makedirs(f"{VOLUME_PATH}/logs", exist_ok=True)

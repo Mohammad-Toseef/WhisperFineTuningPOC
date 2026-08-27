@@ -66,11 +66,11 @@ training:
   # History: smoke test 535 clips -> ~15/epoch -> 120 (~8 ep).
   #          49-ep run 2011 clips -> 63/epoch -> 567 (~9 ep); BEST WAS EPOCH 6,
   #          and 7-9 were slightly worse — the overfitting curve made visible.
-  # ROUND 2: 8256 train clips -> ceil(8256/32) = 258/epoch -> 774 (3 epochs).
+  # ROUND 2: 8123 train clips -> ceil(8123/32) = 254/epoch -> 762 (3 epochs).
   # Fewer epochs than round 1 on purpose: this starts from a trained model AND
   # has ~4x the data, so one epoch here teaches far more than one epoch there.
-  max_steps: 774
-  warmup_steps: 77   # ~10% of max_steps — small updates first so the opening
+  max_steps: 762
+  warmup_steps: 76   # ~10% of max_steps — small updates first so the opening
                      # steps cannot jolt the resumed adapter
 
   gradient_checkpointing: true
@@ -78,8 +78,8 @@ training:
   evaluation_strategy: "steps"
   # Once per epoch => 3 evals. save_steps must stay a multiple of eval_steps or
   # load_best_model_at_end cannot find the best checkpoint.
-  eval_steps: 258
-  save_steps: 258
+  eval_steps: 254
+  save_steps: 254
   save_total_limit: 3
   load_best_model_at_end: true
   # The BLENDED wer, deliberately: the eval split spans two corpora and a

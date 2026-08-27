@@ -1,4 +1,4 @@
-# Round 2 — Whisper Large-v3 LoRA Continuation Run (Batch 3)
+﻿# Round 2 — Whisper Large-v3 LoRA Continuation Run (Batch 3)
 
 Planning + tracking doc for the second fine-tuning round. Supersedes nothing — round 1 is
 recorded in [`FULL_WHISPER_TRAINING_RUN.md`](FULL_WHISPER_TRAINING_RUN.md) and stays the
@@ -7,9 +7,21 @@ baseline. Planned 2026-08-27 (session 015). **NOT YET EXECUTED.**
 ---
 
 ## Goal
-Continue the round-1 LoRA adapter on the 96-episode reviewed Batch 3 corpus, primarily to fix
-**sustained English audio producing fabricated Urdu** (session 014 blocking item #16) without
-losing round 1's domain-term gains.
+
+Continue the round-1 LoRA adapter on the 96-episode reviewed Batch 3 corpus. Priority order,
+**stated by the user 2026-08-27** — this ordering drives the eval design and the success criteria:
+
+1. **PRIMARY — transcribe Urdu speech correctly, with fewer spelling mistakes.**
+2. **SECONDARY — code-switching**, including session 014's blocking item #16 (sustained English
+   audio producing fabricated Urdu).
+
+…without losing round 1's domain-term gains.
+
+⚠️ This doc originally led with #16 as the primary aim. The reordering changed three things: the
+success criteria (which measured only *retention* and *code-switching*, and nothing about Urdu
+improving), the metrics (**CER added** — WER cannot see spelling), and Set B's composition
+(re-selected to track the corpus distribution instead of over-weighting code-switching). The
+training setup itself needed no change; it was already 75.3% Urdu-only.
 
 Round-1 result to beat, on an eval set that stays identical:
 
@@ -130,8 +142,10 @@ report both. Set A is the **guard rail**; Set B is the **goal**.
 | | Set A | Set B |
 |---|---|---|
 | Corpus | round 1 (49 EP episodes) | Batch 3 (96 episodes) |
-| Clips / hours | 246 / 1.28 | 341 / 1.73 |
-| code_switch | 52 (21%) | **132 (39%)** |
+| Clips / hours | 246 / 1.28 | 474 / 2.36 |
+| nastaliq_only (PRIMARY goal) | 194 (78.9%) | **337 (71.1%)** |
+| code_switch | 52 (21.1%) | 137 (28.9%) |
+| spiritual_term | 129 (52.4%) | 121 (25.5%) |
 | Sustained English (≥10-word run) | **none — round 1 topped out at 8** | present, incl. B3039 |
 | Unseen by round 1 / round 2 | yes / yes | yes / yes |
 | Answers | *did we keep what we had?* | *did we gain what we wanted?* |
@@ -155,8 +169,16 @@ new. Batch 3's `spiritual_term` density is 14.3% vs round 1's 30.4%, so the spec
 1's best result (spiritual_term **9.38%**) eroding while overall WER still looks acceptable.
 
 ### Set B — the Batch-3 holdout (new-capability measurement)
-`B3039, B3028, B3012, B3017, B3031, B3033` — **341 clips / 1.73 hrs (4.0% of Batch 3)**,
-buckets: nastaliq_only 209 / **code_switch 132 (39%)** / spiritual_term 68.
+`B3013, B3017, B3029, B3031, B3039, B3051, B3063, B3076` — **474 clips / 2.36 hrs (5.5% of
+Batch 3)**, buckets: **nastaliq_only 337 (71.1%)** / code_switch 137 (28.9%) /
+spiritual_term 121 (25.5%).
+
+⚠️ **Re-selected 2026-08-27 after the priority was clarified.** The original pick (option 3 below)
+was 38.7% code_switch against Batch 3's real 24.7% — deliberately adversarial for what turned out to
+be the *secondary* goal. Option 2 tracks the corpus distribution far more closely (71.1%
+nastaliq_only) and nearly doubles `spiritual_term` (121 vs 68), which matters because that bucket is
+the **domain-vocabulary spelling** measure. B3039 is retained, and its share of Set B drops from 45%
+to 32%, so the concentration noted below eases too.
 
 **Set A physically cannot measure what round 2 is for.** It holds 52 code_switch clips and — because
 round-1 data topped out at 8 consecutive English words — **no sustained-English examples at all**.
@@ -181,37 +203,40 @@ only way to measure item #16 directly rather than by proxy.
 
 Set B alternatives considered and their trade-offs:
 
-| Option | eval clips | code_switch | B3039 | sustained-Eng left in train | eval cost/pass |
-|---|---|---|---|---|---|
-| 1 — adversarial (9 eps) | 407 (4.7%) | 200 (49%) | no | 62 / 69 | 2.7× |
-| 2 — representative (8 eps) | 474 (5.5%) | 137 (29%) | yes | 65 / 69 | 2.9× |
-| **3 — compact + B3039 (6 eps)** | **341 (4.0%)** | **132 (39%)** | **yes** | **66 / 69** | **2.4×** |
+| Option | eval clips | nastaliq_only | code_switch | spiritual | B3039 | eval cost/pass |
+|---|---|---|---|---|---|---|
+| 1 — adversarial (9 eps) | 407 (4.7%) | 51% | 200 (49%) | 64 | no | 2.7× |
+| **2 — representative (8 eps) ← CHOSEN** | **474 (5.5%)** | **337 (71.1%)** | **137 (28.9%)** | **121** | **yes** | **2.9×** |
+| 3 — compact + B3039 (6 eps) | 341 (4.0%) | 209 (61.3%) | 132 (38.7%) | 68 | yes | 2.4× |
+| *(Batch 3 overall, for reference)* | 8,597 | 75.3% | 24.7% | 14.3% | — | — |
 
-⚠️ **Accepted cost of Option 3:** B3039's 3 sustained-English clips move from "learn from" to
-"measure with". Justified because the fix cannot be measured on clips it trained on, and 66 of
-the 69 sustained-English clips remain in training.
+⚠️ **Accepted cost:** B3039's sustained-English clips move from "learn from" to "measure with".
+Justified because the fix cannot be measured on clips it trained on, and the great majority of the
+69 sustained-English clips remain in training.
 
-⚠️ **Set B's overall WER is NOT comparable to Set A's.** At 39% code_switch vs Batch 3's
-batch-wide 24.7%, it is deliberately the harder subset. Read Set B **per bucket**, never as a
-single headline number, and never against 10.50%.
+⚠️ **Set B's overall WER is still not directly comparable to Set A's** — different corpus, different
+reviewers, different era. Option 2 narrows the distribution gap but does not close it. Read Set B
+**per bucket**, and never against 10.50%.
 
 ### Resulting splits
 | Split | Episodes | Clips | Hours |
 |---|---|---|---|
-| **Train** | 90 (Batch 3 only) | **8,256** | **40.75** |
-| **Eval** | 6 B3 + 7 EP | **587** (341 + 246) | 3.01 |
+| **Train** | 88 (Batch 3 only) | **8,123** | **40.13** |
+| **Eval** | 8 B3 + 7 EP | **720** (474 + 246) | 3.64 |
 
-Train buckets: nastaliq_only ~6,262 / code_switch ~1,994 / spiritual_term ~1,159.
+Combined eval buckets: **nastaliq_only 531 (73.8%)** / code_switch 189 (26.2%) /
+spiritual_term 250 (34.7%) — close to Batch 3's own distribution, which is what the primary goal
+needs.
 
-⚠️ The eval split is **2.4× round 1's 246 clips**, and in-training eval uses
+⚠️ The eval split is **2.9× round 1's 246 clips**, and in-training eval uses
 `predict_with_generate`. That is the main new wall-clock cost; it is why the epoch count comes
 down rather than up.
 
 ### How the two sets are used together
-Set A and Set B go into **ONE combined eval split** (587 clips) in the round-2 dataset, but are
+Set A and Set B go into **ONE combined eval split** (720 clips) in the round-2 dataset, but are
 **reported separately**:
 
-- **Combined for checkpoint selection.** The trainer scores all 587 clips each epoch and
+- **Combined for checkpoint selection.** The trainer scores all 720 clips each epoch and
   `load_best_model_at_end` therefore picks a checkpoint good at *both*, not one that wins on new
   data by sacrificing old.
 - **Separated for reading.** Change #6 reports `wer_r1` / `wer_b3` alongside the blended `wer`.
@@ -231,10 +256,10 @@ Set A and Set B go into **ONE combined eval split** (587 clips) in the round-2 d
 | learning_rate | 1.0e-5 | **5.0e-6** | warm start from a converged adapter; halved to limit forgetting |
 | per_device_train_batch_size | 8 | 8 | |
 | gradient_accumulation_steps | 4 | 4 | effective batch **32** |
-| steps/epoch | 63 | **258** | ceil(8256/32) |
-| max_steps | 567 (~9 ep) | **774 (~3 ep)** | warm start + 4× data ⇒ far fewer epochs |
+| steps/epoch | 63 | **254** | ceil(8123/32) |
+| max_steps | 567 (~9 ep) | **762 (~3 ep)** | warm start + 4× data ⇒ far fewer epochs |
 | warmup_steps | 57 | **77** | ~10% |
-| eval_steps / save_steps | 63 / 63 | **258 / 258** | once per epoch; save%eval==0 so `load_best` works |
+| eval_steps / save_steps | 63 / 63 | **254 / 254** | once per epoch; save%eval==0 so `load_best` works |
 | fp16 / gradient_checkpointing | true / true | unchanged | |
 | metric_for_best_model | wer | wer (blended) | plus `wer_r1` / `wer_b3` reported, see below |
 | GPU / timeout | A10G / 8 h | **A10G / 12 h** | ~4.4 h train + 3 eval passes + 8.8k-clip feature extraction |
@@ -260,7 +285,7 @@ visible if the two eval sources are reported separately — hence `wer_r1` / `we
 | 6 | ✅ **DONE** `modal_app.py::train` | `compute_metrics` reports `wer_r1` / `wer_b3` alongside the blended `wer` | ★ the forgetting tripwire |
 | 7 | ✅ **DONE** `modal_app.py::evaluate` | `--dataset-path` + `--model-path`, **per-source and source×bucket reporting** | ★ needed for the final table; without it, 6 runs instead of 3 |
 | 8 | ✅ **DONE** `modal_app.py::train` | timeout 8 h → 12 h | ★ |
-| 9 | ✅ **DONE** `config/training_config.yaml` | `run_tag: r2`, `resume_from_adapter`, `dataset_path`, 774 steps / 3 epochs, LR 5.0e-6 | ★ the switch that turns round 2 on |
+| 9 | ✅ **DONE** `config/training_config.yaml` | `run_tag: r2`, `resume_from_adapter`, `dataset_path`, 762 steps / 3 epochs, LR 5.0e-6 | ★ the switch that turns round 2 on |
 
 ### Status of #1–#3 (built 2026-08-27)
 
@@ -355,11 +380,16 @@ checkpoint should be good at both. These make the blend's *composition* visible.
 `dataset.map(remove_columns=...)`, which strips `sentence`. Built after, there would be nothing left
 to align the sidecar against. Asserted in the test.
 
-Why it matters at all: with Set B at 341 of 587 clips and Set A at 246, a 4-point gain on B against
-a 4-point loss on A reads as `0.58 × (−4) + 0.42 × (+4) = −0.6` — a *small improvement*. That is
+Why it matters at all: with Set B at 474 of 720 clips and Set A at 246, a 4-point gain on B against
+a 4-point loss on A reads as `0.66 × (−4) + 0.34 × (+4) = −1.3` — a *modest improvement*. That is
 forgetting, displayed as progress. And it now shows at **epoch 1 (~1.5 h in)** rather than after the
 run, which is the difference between wasting one epoch and wasting ~4.4 h of A10G. Zero extra GPU:
 the predictions already exist, this slices them.
+
+Since the priority reordering, `compute_metrics` reports **`cer` and `cer_r1` / `cer_b3` too** — the
+per-epoch spelling signal, which is what criterion 1 is about. The CER metric is loaded inside a
+`try` on purpose: it is a reporting by-product, and an exception at the first eval would kill a ~6 h
+run ~90 minutes in. Same reasoning as the `Binarize` catch in `modal_align.py`.
 
 **#7** — `evaluate(which, dataset_path, model_path)`, both falling back to today's behaviour.
 Reports overall, per bucket, **per source**, and **source × bucket** — the last being the table the
@@ -396,14 +426,14 @@ until this file turned it on. **Decisions taken: 3 epochs, LR 5.0e-6.**
 | `lora.resume_from_adapter` | — | `/data/model/whisper-urdu-lora-adapter` |
 | `data.dataset_path` | `/processed/dataset` | `/processed/dataset_r2` |
 | `learning_rate` | 1.0e-5 | **5.0e-6** |
-| `max_steps` | 567 (~9 ep) | **774 (3 ep × 258)** |
+| `max_steps` | 567 (~9 ep) | **762 (3 ep × 254)** |
 | `warmup_steps` | 57 | **77** (9.9%) |
-| `eval_steps` / `save_steps` | 63 / 63 | **258 / 258** (3 evals) |
+| `eval_steps` / `save_steps` | 63 / 63 | **254 / 254** (3 evals) |
 | `output_dir` | `…/whisper-large-v3-urdu` | `…/whisper-large-v3-urdu-r2` |
 | `logging_dir` | `/data/logs` | `/data/logs/r2` |
 
 **The step arithmetic is verified against the real manifest, not assumed:** Batch 3 minus Set B is
-**8,256** train clips, effective batch 8×4 = 32, so `ceil(8256/32) = 258` steps/epoch and 774 is
+**8,123** train clips, effective batch 8×4 = 32, so `ceil(8123/32) = 254` steps/epoch and 762 is
 exactly 3 epochs. `save_steps % eval_steps == 0`, so `load_best_model_at_end` can find the best
 checkpoint.
 
@@ -494,7 +524,7 @@ python scripts/convert_reviewed_manifest.py "data/processed/Batch3/Batch 3_revie
 python src/dataset_builder.py `
   data/processed/Batch3/manifest_reviewed.json ./data/processed/dataset_r2 `
   --eval-only-manifest data/processed/manifest_reviewed.json `
-  --eval-episodes B3039_<ytid>,B3028_<ytid>,B3012_<ytid>,B3017_<ytid>,B3031_<ytid>,B3033_<ytid>,EP5_vwzNL2oziZs,EP6_SrVnpBqd7bI,EP34_h87EJF0Zvco,EP41_mBtP9NKha1g,EP43_m8-37sgUwUQ,EP44_paAJQ3OKB-8,EP47_a0NiZST0S6Q
+  --eval-episodes B3013_XqT8W6Aqpug,B3017_FARjVywUYpA,B3029_9fYyFC7TlVg,B3031_rWVxHX5yIRw,B3039_UnaZu-y5G3s,B3051_jnOCvu03zXM,B3063_FfWwQvaXizA,B3076_FS_nv_p3W1g,EP5_vwzNL2oziZs,EP6_SrVnpBqd7bI,EP34_h87EJF0Zvco,EP41_mBtP9NKha1g,EP43_m8-37sgUwUQ,EP44_paAJQ3OKB-8,EP47_a0NiZST0S6Q
 
 # 3. Upload (PowerShell, ROOT-RELATIVE remote paths, ~4.4 GB)
 modal volume put whisper-training-vol ./data/processed/dataset_r2 /processed/dataset_r2 --force
@@ -541,7 +571,7 @@ the far more serious "worse than no fine-tuning at all".
 
 ### What we already have vs what must be run
 
-| Model | Set A (246 clips) | Set B (341 clips) |
+| Model | Set A (246 clips) | Set B (474 clips) |
 |---|---|---|
 | Base large-v3 | 18.57% ✅ have | ⚠️ **needs a run** |
 | Round 1 | 10.50% ✅ have | ⚠️ **needs a run** |
@@ -564,7 +594,7 @@ bug returned an empty set unconditionally and was caught only by a positive cont
 volume contents, not by reading the code. An empty or unchanged result proves nothing on its own.
 
 ### Only THREE eval runs are needed, not six
-Because `dataset_r2`'s eval split **already contains both sets** (587 clips), one pass per model
+Because `dataset_r2`'s eval split **already contains both sets** (720 clips), one pass per model
 yields Set A and Set B together — provided `evaluate()` reports per source, which is why change #7
 must add the split to `evaluate()` and not only to training's `compute_metrics`. The `episode` field
 `dataset_builder` already writes into `eval_buckets.json` is what makes the split derivable
@@ -587,26 +617,26 @@ what needs fixing, and that is far better learned before the round-2 numbers arr
 ### How Batch 3 divides
 | | clips | share | hours | episodes |
 |---|---|---|---|---|
-| **Train** | 8,256 | **96.0%** | 40.75 | 90 |
-| **Eval (Set B)** | 341 | **4.0%** | 1.73 | 6 |
+| **Train** | 8,123 | **94.5%** | 40.13 | 88 |
+| **Eval (Set B)** | 474 | **5.5%** | 2.36 | 8 |
 
-The eval split itself is larger than Batch 3's 4%, because round 1's episodes join it:
-**Set B 341 (58.1%) + Set A 246 (41.9%) = 587 clips.** Round 1's episodes are 42% of what is
+The eval split itself is larger than Batch 3's 5.5%, because round 1's episodes join it:
+**Set B 474 (65.8%) + Set A 246 (34.2%) = 720 clips.** Round 1's episodes are 34% of what is
 evaluated and 0% of what is trained.
 
-Round 1 held out **10.9%** of its corpus; round 2 holds out **4.0%**. That is the same decision
+Round 1 held out **10.9%** of its corpus; round 2 holds out **5.5%**. That is the same decision
 against a bigger corpus, not a loss of rigour — what an eval set needs is absolute size, and Set B
 (341) is larger than round 1's entire eval set (246), with `code_switch` at 132 vs round 1's 52.
 Round 1 had to spend 10.9% to reach a usable size because its corpus was small.
 
-### ⚠️ The clean holdout is ALREADY EXHAUSTED — 587 clips is all there is
+### ⚠️ The clean holdout is ALREADY EXHAUSTED — 720 clips is all there is
 An eval set only means anything on clips the model never trained on. For the **round-2** model:
 
 | data | clips | clean? |
 |---|---|---|
-| Batch 3 — Set B (6 eps) | 341 | ✅ never trained on |
+| Batch 3 — Set B (8 eps) | 474 | ✅ never trained on |
 | Round 1 — Set A (7 pinned eps) | 246 | ✅ never trained on, round 1 *or* 2 |
-| Batch 3 — the 90 train episodes | 8,256 | ❌ trained on in round 2 |
+| Batch 3 — the 88 train episodes | 8,123 | ❌ trained on in round 2 |
 | Round 1 — its other 42 episodes | 2,011 | ❌ **trained on in ROUND 1** |
 
 That last row is the easy one to miss: round 2 does not train on round-1 data, but it **inherits
@@ -622,15 +652,19 @@ data left. (The 4,000 unlabelled videos support eyeball comparison — as round 
 - Hold out 8% and not need it → nothing lost, that data can train in a future round 3.
 - Train on it now → permanently unusable as eval for this model. No later decision undoes it.
 
-Decision taken: **keep 4%**, because 341 clips is not inadequate and every bucket a criterion
-depends on is well populated. Recorded as a **one-way** choice, not a low-stakes one.
+**Decision REVISED to 5.5%** (was 4%) when the priority was clarified — see the Set B section. The
+extra ~133 eval clips buy a distribution much closer to the corpus (71.1% nastaliq_only vs 61.3%)
+and nearly double `spiritual_term`, which is the domain-spelling instrument the primary goal needs.
+Cost: 133 training clips and an eval pass at 2.9× rather than 2.4×.
 
-⚠️ **Set B is concentrated**: episode sizes are `23, 29, 44, 44, 47, 154`, so **B3039 alone is 45% of
-Set B** (its episodes average 56.8 clips vs Batch 3's 89.6 — 63% of typical, which is why the episode
-share 6.2% exceeds the clip share 4.0%). Checked, and it touches no criterion: retention is measured
-on Set A; `code_switch` draws only ~23% of its 132 clips from B3039; and Set B's *overall* WER was
-never meant to be read as a headline. Would have been a defect if the code_switch bucket were
-concentrated too — it is not.
+Recorded as a **one-way** choice, and this is exactly why it was worth revisiting *before* the build:
+had the dataset already been built and trained on, the 133 clips could not have been reclaimed.
+
+⚠️ **Set B remains somewhat concentrated**: B3039 is 154 of 474 clips = **32%** (down from 45% under
+the 6-episode pick). Checked against every criterion and it touches none: retention is measured on
+Set A; `code_switch` draws only ~22% of its 137 clips from B3039; and Set B's *overall* WER was never
+meant to be read as a headline. It would have been a defect had `code_switch` or `nastaliq_only` been
+concentrated too — neither is.
 
 ---
 
@@ -659,31 +693,48 @@ still written, minus the per-clip labels. `bmeta` is initialised empty specifica
 
 ## Success criteria (set BEFORE the run, so the result cannot be rationalised)
 
-All four are framed against **round 1**, not base — round 1 is the primary baseline (see above).
+### ★ Stated priority (user, 2026-08-27), and criteria ordered to match it
+> **1st — transcribe Urdu speech correctly, with fewer spelling mistakes.
+> 2nd — code-switching.**
 
-| # | Criterion | Baseline | Measured on |
-|---|---|---|---|
-| 1 | **No forgetting**: overall norm WER ≤ ~11%, i.e. not materially worse than round 1 | r1 = 10.50% | Set A |
-| 2 | **Domain retained**: `spiritual_term` stays near round 1's best result | r1 = 9.38% | Set A |
-| 3 | **Code-switch improves**: `code_switch` beats round 1 on identical clips | r1 on Set B — **must be measured, does not exist yet** | Set B |
-| 4 | **Item #16 fixed**: B3039 chunks 043/044 transcribe as English, not fabricated Urdu | the reviewers' corrected English | B3039, qualitative |
+The criteria were originally two retention checks plus two code-switching checks, i.e. **nothing
+measured improvement in the primary goal.** Reordered:
 
-Criterion 4 is the one this round exists for, and it is qualitative on purpose — WER on 3 clips
-is not a statistic. Read the actual output text.
+| # | Criterion | Priority | Baseline | Read from |
+|---|---|---|---|---|
+| **1** | **Urdu improves**: `nastaliq_only` WER **and CER** both fall on fresh Batch-3 Urdu | **PRIMARY** | r1 on Set B — **must be measured, does not exist yet** | `b3/nastaliq_only` |
+| 2 | **No forgetting**: overall norm WER ≤ ~11%, not materially worse than round 1 | guard | r1 = 10.50% | Set A |
+| 3 | **Domain retained**: `spiritual_term` stays near round 1's best result | guard | r1 = 9.38% | `r1/spiritual_term` |
+| 4 | **Code-switch improves**: `code_switch` beats round 1 on identical clips | secondary | r1 on Set B | `b3/code_switch` |
+| 5 | **Item #16 fixed**: B3039 chunks 043/044 come out as English, not fabricated Urdu | secondary | the reviewers' corrected English | predictions sidecar, qualitative |
 
-⚠️ **Criterion 3 cannot be evaluated until r1 has been run on Set B.** That baseline is the first
-eval run for exactly this reason: without it, a round-2 `code_switch` number on Set B has nothing to
-be better *than*, and the temptation is to read it against Set A's 12.70% — which is a different
-corpus, a different distribution, and not a valid comparison.
+**Criterion 1 needs CER, not just WER.** WER is binary per word — a word missing one diacritic
+scores exactly the same as a wholly wrong word — so it cannot tell "spelling improved" from "words
+changed". CER counts characters and shows the magnitude. Both are now reported everywhere, at no
+extra GPU cost.
 
-⚠️ **A regression on criteria 1–2 with a gain on 3 is the expected failure mode**, not a surprise:
-it is precisely what sequential fine-tuning on a differently-distributed corpus does. If it happens,
-the lever is the learning rate (and secondarily the epoch count), not the data — see open question 2.
+Why the training signal should move criterion 1 at all: **7,200 of 8,597 transcripts (83.8%) were
+edited by reviewers, at a median character similarity of 0.970** — 82.8% of edits are ≥0.90 similar
+and only 5.6% are heavy rewrites. The typical edit changes ~3% of characters, i.e. a few letters in a
+~150-character clip. That is 40 hours of dense, surgical spelling supervision, which is exactly what
+criterion 1 asks about.
+
+Criterion 5 is qualitative on purpose — WER over 3 clips is not a statistic. Read the actual text,
+now available in the predictions sidecar without a separate run.
+
+⚠️ **Criteria 1 and 4 cannot be evaluated until r1 has been run on Set B.** That is why it is the
+first eval run: without it, a round-2 number on Set B has nothing to be better *than*, and the
+temptation is to read it against Set A — a different corpus, a different distribution, not a valid
+comparison.
+
+⚠️ **A gain on 1/4 alongside a regression on 2/3 is the expected failure mode**, not a surprise —
+it is what sequential fine-tuning on a differently-distributed corpus does. The lever is the
+learning rate (then the epoch count), not the data.
 
 ---
 
 ## Open questions for discussion
-1. **Epoch count** — 3 (774 steps) is the proposal. 2 is cheaper and less forgetting-prone;
+1. **Epoch count** — 3 (762 steps) is the proposal. 2 is cheaper and less forgetting-prone;
    4 risks overfitting a warm-started adapter. Round 1 converged at epoch 6 of 9 from scratch.
 2. **LR 5e-6** — halved from round 1 by judgement, not measurement. Alternative: keep 1e-5 and
    rely on `load_best_model_at_end` + the epoch-1 Set A tripwire to catch forgetting.
