@@ -319,6 +319,146 @@ def test_train_fails_loudly_on_the_silent_no_ops():
     assert '"lora_B" in n' in segment, "the lora_B non-zero check is missing"
 
 
+def test_weight_movement_is_checked_after_training():
+    """The three raises above all fire BEFORE step 1, so they prove the adapter is
+    loaded and trainable — not that it moved. Under fp16 the grad scaler skips any
+    step with inf/NaN gradients; if every step is skipped the run still logs a loss
+    curve and saves an adapter identical to the resume source.
+
+    The signature must be taken before trainer.train(), and the comparison must sit
+    AFTER the adapter commit (so it cannot destroy finished training) and BEFORE
+    merge_and_unload (so no merged model is minted from untrained weights).
+    """
+    lines = code_lines(train_block(MODAL_APP.read_text(encoding="utf-8")))
+
+    def idx(pred, what):
+        i = next((i for i, l in enumerate(lines) if pred(l)), None)
+        assert i is not None, f"{what} not found in train()"
+        return i
+
+    i_sig = idx(lambda l: l.startswith("pre_train_sig = {"), "the pre-training snapshot")
+    i_train = idx(lambda l: l == "trainer.train()", "trainer.train()")
+    i_save = idx(lambda l: l == "model.save_pretrained(out_adapter)", "the adapter save")
+    i_commit = next(i for i, l in enumerate(lines) if l == "volume.commit()" and i > i_save)
+    i_moved = idx(lambda l: l.startswith("moved = sum("), "the moved-weights comparison")
+    i_merge = idx(lambda l: "merge_and_unload" in l, "merge_and_unload")
+
+    assert i_sig < i_train, (
+        f"the weight signature must be taken BEFORE training (sig={i_sig} "
+        f"train={i_train}) — snapshotting after is a tautology")
+    assert i_commit < i_moved < i_merge, (
+        f"the check must sit between the adapter commit and the merge; got "
+        f"commit={i_commit} check={i_moved} merge={i_merge}")
+
+    # A print here would leave the failure exactly as silent as it is without the
+    # check, and the merge would still produce a round-2 model from untrained weights.
+    tail = "\n".join(lines[i_moved:i_merge])
+    assert "raise RuntimeError" in tail, (
+        "the moved-weights check must RAISE, not warn — otherwise the merge still runs")
+
+
+def _lifted(name: str) -> str:
+    """Source text of the `name = ...` assignment inside train(), via AST.
+
+    Lifted rather than reimplemented: a test that retypes the logic proves the
+    reimplementation works, which is not the question.
+    """
+    src = MODAL_APP.read_text(encoding="utf-8")
+    fn = next(n for n in ast.walk(ast.parse(src))
+              if isinstance(n, ast.FunctionDef) and n.name == "train")
+    for node in ast.walk(fn):
+        if isinstance(node, ast.Assign) and any(
+                getattr(t, "id", "") == name for t in node.targets):
+            return ast.get_source_segment(src, node)
+    raise AssertionError(f"{name} assignment not found in train()")
+
+
+def test_moved_weights_check_answers_correctly():
+    """Runs the ACTUAL snapshot/compare lines from train() against a real tiny
+    module, because ordering alone does not prove the comparison is right.
+
+    Covers the case the guard exists for (nothing moved), the cases that must NOT
+    trip it (only the frozen base moved; a single tensor moved), and a regression
+    for the cancelling signature this test caught -- see balanced_signs below.
+    """
+    try:
+        import torch
+        import torch.nn as nn
+    except ImportError:
+        skip("torch not installed")
+
+    sig_src, moved_src = _lifted("pre_train_sig"), _lifted("moved")
+
+    class Tiny(nn.Module):
+        """PEFT's naming: lora_A/lora_B trainable, base frozen. lora_B starts at
+        zeros exactly as a fresh adapter does."""
+
+        def __init__(self):
+            super().__init__()
+            # Seeded: an unseeded randn made the tiny-nudge scenario pass or fail
+            # on the draw, which is how the signature's precision limit was found
+            # in the first place.
+            torch.manual_seed(0)
+            self.lora_A = nn.Parameter(torch.randn(4, 4))
+            self.lora_B = nn.Parameter(torch.zeros(4, 4))
+            self.base_layer = nn.Parameter(torch.randn(4, 4))
+            self.base_layer.requires_grad = False
+
+    def moved_after(mutate, setup=None) -> tuple[int, int]:
+        model = Tiny()
+        if setup is not None:      # runs BEFORE the snapshot, to shape the weights
+            with torch.no_grad():
+                setup(model)
+        env = {"model": model}
+        exec(sig_src, env)  # noqa: S102 - executing our own source, on purpose
+        mutate(env["model"])
+        exec(moved_src, env)  # noqa: S102
+        return env["moved"], len(env["pre_train_sig"])
+
+    def real_step(model):
+        opt = torch.optim.AdamW(
+            [p for p in model.parameters() if p.requires_grad], lr=5e-6)
+        ((model.lora_A.sum() + model.lora_B.sum() * 2) ** 2).backward()
+        opt.step()
+
+    def add_to(attr, eps):
+        def go(model):
+            with torch.no_grad():
+                getattr(model, attr).add_(eps)
+        return go
+
+    # Only lora_* trainable params are watched — a frozen base tensor is not training.
+    _, n_watched = moved_after(lambda m: None)
+    assert n_watched == 2, f"expected lora_A + lora_B watched, got {n_watched}"
+
+    healthy, _ = moved_after(real_step)
+    assert healthy > 0, "a real AdamW step at the round-2 lr registered as no movement"
+
+    # THE failure this guard exists for: fp16 grad scaler skipped every step.
+    stalled, _ = moved_after(lambda m: None)
+    assert stalled == 0, f"untouched weights reported {stalled} moved — guard is blind"
+
+    base_only, _ = moved_after(add_to("base_layer", 1.0))
+    assert base_only == 0, "movement in the FROZEN base counted as training"
+
+    # The raise needs EVERY tensor unmoved, so partial movement must pass.
+    for attr, eps in (("lora_A", 1e-7), ("lora_B", 1e-8)):
+        one, _ = moved_after(add_to(attr, eps))
+        assert one > 0, f"{attr} moved by {eps} went undetected"
+
+    # REGRESSION: the signature was `.float().abs().sum()`, which is blind here.
+    # With exactly balanced signs, a uniform +eps cancels term-for-term in an
+    # ABSOLUTE sum (|x+e| shrinks where x<0 by what it grows where x>0), so a
+    # changed tensor read as unchanged. Squares cannot cancel.
+    def balanced_signs(model):
+        model.lora_A.copy_(torch.tensor([[1.0, -1.0, 2.0, -2.0]] * 4))
+
+    adversarial, _ = moved_after(add_to("lora_A", 1e-6), setup=balanced_signs)
+    assert adversarial > 0, (
+        "a uniform +1e-6 on a balanced-sign tensor went undetected — the signature "
+        "is cancelling, which is what `.abs().sum()` did before it was squared")
+
+
 # ── plain-python runner (pytest is not installed in either venv) ──────────────
 if __name__ == "__main__":
     tests = [(n, o) for n, o in sorted(globals().items())

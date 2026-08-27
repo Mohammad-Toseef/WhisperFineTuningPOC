@@ -459,6 +459,26 @@ def train():
         tokenizer=processor.feature_extractor,
     )
 
+    # ── Weight signature, for the one silent no-op left ────────────
+    # Every guard above runs BEFORE the first step, so together they prove the
+    # adapter is loaded and trainable at step 0 — NOT that it ever moved. With
+    # fp16 the gradient scaler skips any step whose gradients are inf/NaN; if
+    # every step is skipped, the run still produces a loss curve, three evals and
+    # a saved adapter byte-identical to the one it resumed from. Snapshot now and
+    # compare after training, below.
+    # The live version of this signal is `grad_norm` in the logs every
+    # logging_steps (25): a run of 0.0 or nan there is this failure happening.
+    # Squared L2, in float64. Not `.abs().sum()`: for a tensor with a balanced
+    # sign distribution an added epsilon largely cancels in an absolute sum
+    # (|x+e| shrinks where x<0, grows where x>0), and a float32 sum swallows the
+    # remainder — a genuinely-changed tensor can read as unchanged. Squares
+    # cannot cancel, and float64 keeps the resolution.
+    pre_train_sig = {
+        n: p.detach().double().pow(2).sum().item()
+        for n, p in model.named_parameters()
+        if p.requires_grad and "lora_" in n
+    }
+
     print("🏋️  Starting training...")
     trainer.train()
 
@@ -472,6 +492,40 @@ def train():
     # merged model would discard hours of training that had already succeeded.
     volume.commit()
     print(f"   ✅ adapter committed — training is now safe even if the merge fails")
+
+    # ── Did the weights actually MOVE? ─────────────────────────────
+    # Placed after the save/commit on purpose, for the same reason the commit was
+    # moved before the merge: a check at the end of a ~6 h run must never be able
+    # to destroy training that already succeeded. On a true positive nothing is
+    # lost by keeping the file — the adapter equals the resume source, which is
+    # backed up — and raising here skips the merge, so no "production" round-2
+    # model is ever minted from untrained weights.
+    #
+    # Compared as "changed at all", not within a tolerance: any real optimizer
+    # step moves these. A raise needs EVERY tensor unmoved, so one coincidental
+    # abs-sum collision cannot trigger it.
+    if not pre_train_sig:
+        # Cannot happen while the trainable>0 guard holds and PEFT names its
+        # parameters lora_A/lora_B. Warn rather than raise: an inoperative check
+        # is not evidence of a bad adapter, and this is not the place to guess.
+        print("⚠️  no LoRA parameters were snapshotted, so the moved-weights check "
+              "did NOT run — verify this adapter against round 1's before trusting it.")
+    else:
+        moved = sum(1 for n, p in model.named_parameters()
+                    if n in pre_train_sig
+                    and p.detach().double().pow(2).sum().item() != pre_train_sig[n])
+        if moved == 0:
+            raise RuntimeError(
+                f"training finished but NONE of the {len(pre_train_sig)} LoRA tensors "
+                f"changed — the adapter just saved to {out_adapter} is identical to "
+                "what training started from, so this run taught the model nothing. "
+                "Under fp16 that is what an all-steps-skipped run looks like (the "
+                "grad scaler rejecting inf/NaN gradients every step); check grad_norm "
+                "in the logs, and lower the learning rate or disable fp16. The adapter "
+                "was kept for inspection; the merge was SKIPPED deliberately."
+            )
+        print(f"✅ weights moved: {moved}/{len(pre_train_sig)} LoRA tensors changed "
+              "during training")
 
     print("🔀 Merging adapter into base model for production format...")
     merged_model = model.merge_and_unload()

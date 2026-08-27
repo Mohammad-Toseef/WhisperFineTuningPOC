@@ -399,6 +399,37 @@ distinguishes "resumed round 1" from "silently started from scratch", **the one 
 parameter count and a loss curve look identical under**, and it closes the gap that #3 could not
 verify locally. Gated on `resume_from`, since a fresh adapter is legitimately zero.
 
+#### #4b — a fourth check: did the weights actually MOVE? (added 2026-08-28)
+
+All three raises above fire **before step 1**. Together they prove the adapter is loaded and
+trainable at step 0 — *not* that it ever changed. One path survives all of them: with `fp16: true`
+the gradient scaler **skips** any step whose gradients are `inf`/`NaN`. If every step is skipped, the
+run produces a loss curve, three evals, and a saved adapter **byte-identical to round 1's**. Low
+probability — round 1 ran fp16 at *twice* this learning rate — but invisible in the artifact
+afterwards, which is the whole problem.
+
+So `train()` now snapshots a squared-L2 signature of every trainable `lora_*` tensor before
+`trainer.train()` and compares after, raising if **zero** tensors changed.
+
+Two deliberate design choices:
+
+- **The check runs after the adapter save and commit**, for the same reason the commit was moved
+  before the merge: a check at the end of a ~6 h run must never be able to destroy training that
+  already succeeded. On a true positive nothing is lost — the adapter equals the resume source, which
+  is backed up — and raising there **skips the merge**, so no "production" round-2 model is minted
+  from untrained weights. If the snapshot is somehow empty the code *warns* rather than raises: an
+  inoperative check is not evidence of a bad adapter.
+- **Squared L2, in float64** — not `.abs().sum()`, which was the first version and is blind. On a
+  tensor with balanced signs a uniform `+ε` cancels term-for-term in an absolute sum (`|x+ε|` shrinks
+  where `x<0` by roughly what it grows where `x>0`), and a float32 sum swallows the remainder, so a
+  genuinely-changed tensor reads as unchanged. Found by the behavioural test below, not by review.
+
+It correctly stays quiet when `load_best_model_at_end` restores an earlier checkpoint — those weights
+still differ from the starting point.
+
+**Live version of the same signal:** `grad_norm`, printed every `logging_steps` (25). A run of `0.0`
+or `nan` there *is* this failure happening — kill it rather than waiting for the guard.
+
 ### Status of #6–#8 (built 2026-08-27)
 
 **A supporting change first:** `dataset_builder` now writes **`source`** into each
@@ -859,14 +890,24 @@ Verified clean, no changes needed:
 break the moment the pin moves.
 
 ### ✅ The checks now live in the repo, not in a scratchpad
-`tests/test_round2_preflight.py` — **15 checks, read-only, no GPU, seconds.**
+`tests/test_round2_preflight.py` — **17 checks, read-only, no GPU, seconds.**
 **Re-run after ANY edit to `training_config.yaml` or `modal_app.py`:**
 ```
 python tests/test_round2_preflight.py      # no pytest needed
 ```
 Ships a `__main__` runner because neither venv has pytest, and skips rather than fails when the
-gitignored manifests are absent. Verified with a **mutation-based negative control: 17 deliberate
-breakages introduced, 17 caught** — a test that cannot fail is worthless.
+gitignored manifests are absent. Verified with a **mutation-based negative control: 21 deliberate
+breakages introduced, 21 caught** — a test that cannot fail is worthless.
+
+Two of the 17 cover #4b, and they cover different things — deliberately:
+
+| check | what it can catch |
+|---|---|
+| `test_weight_movement_is_checked_after_training` | **structure**: snapshot before `trainer.train()`, comparison between the commit and the merge, and a `raise` rather than a `print` |
+| `test_moved_weights_check_answers_correctly` | **behaviour**: runs the real snapshot/compare lines (lifted by AST, not retyped) against a tiny `nn.Module` over 6 scenarios — nothing moved, a real AdamW step at 5e-6, only the frozen base moved, single-tensor nudges, and a balanced-sign tensor |
+
+The structural check alone would have passed the broken `.abs().sum()` signature. The behavioural one
+failed it, which is how the cancellation was found — so the last scenario is kept as a regression.
 
 ### What to read in the first minute of the run
 `train()` prints these before any real GPU time is spent, and they are the confirmation that resume,
@@ -874,8 +915,13 @@ breakages introduced, 17 caught** — a test that cannot fail is worthless.
 1. the **resolved layout** (dataset / resume / adapter / merged / ckpts / logs)
 2. `✅ N trainable / M total` — must be non-zero
 3. `✅ resume confirmed: N/M lora_B tensors carry trained (non-zero) weights`
-4. at **step 254 (epoch 1)**: `eval_wer_r1` — the forgetting tripwire. Far above 10.50% ⇒ stop,
+4. from **step 25 onward**: `grad_norm` in the logging lines — `0.0` or `nan` means fp16 is skipping
+   every step and the run is training nothing. Kill it; don't wait for the end-of-run guard.
+5. at **step 254 (epoch 1)**: `eval_wer_r1` — the forgetting tripwire. Far above 10.50% ⇒ stop,
    lower the LR, restart. ~$2, not ~$8.
+
+At the **end** of the run, two lines confirm the run was real rather than merely complete:
+`✅ adapter committed` then `✅ weights moved: N/M LoRA tensors changed during training`.
 
 ---
 
