@@ -257,9 +257,9 @@ visible if the two eval sources are reported separately — hence `wer_r1` / `we
 | 3 | ✅ **DONE** `modal_app.py::train` | resume via `PeftModel.from_pretrained(model, adapter, is_trainable=True)`, behind `lora.resume_from_adapter` | ⛔ required |
 | 4 | ✅ **DONE** `modal_app.py::train` | assert trainable params > 0, **plus a `lora_B` non-zero check** that the resumed weights are trained rather than fresh | ⛔ see trap below |
 | 5 | ✅ **DONE** `modal_app.py` | `training.run_tag` versions adapter / merged model / eval_results | ⛔ see volume hygiene |
-| 6 | `modal_app.py::train` | `compute_metrics` reports `wer_r1` / `wer_b3` by slicing the eval order via `eval_buckets.json` | ★ the forgetting tripwire |
-| 7 | `modal_app.py::evaluate` | `--dataset-path` + `--model-path` overrides, **plus per-source reporting** (Set A vs Set B, derived from `eval_buckets.json`'s `episode` field) so one pass per model yields both | ★ needed for the final table; without the split it takes 6 runs instead of 3 |
-| 8 | `modal_app.py::train` | timeout 8 h → 12 h | ★ |
+| 6 | ✅ **DONE** `modal_app.py::train` | `compute_metrics` reports `wer_r1` / `wer_b3` alongside the blended `wer` | ★ the forgetting tripwire |
+| 7 | ✅ **DONE** `modal_app.py::evaluate` | `--dataset-path` + `--model-path`, **per-source and source×bucket reporting** | ★ needed for the final table; without it, 6 runs instead of 3 |
+| 8 | ✅ **DONE** `modal_app.py::train` | timeout 8 h → 12 h | ★ |
 | 9 | `config/training_config.yaml` | steps/warmup/eval_steps/LR per the table above; new `lora.resume_from_adapter` key | ★ |
 
 ### Status of #1–#3 (built 2026-08-27)
@@ -336,6 +336,54 @@ why a fresh adapter is a no-op at step 0 — so a trained adapter cannot be all-
 distinguishes "resumed round 1" from "silently started from scratch", **the one failure mode a
 parameter count and a loss curve look identical under**, and it closes the gap that #3 could not
 verify locally. Gated on `resume_from`, since a fresh adapter is legitimately zero.
+
+### Status of #6–#8 (built 2026-08-27)
+
+**A supporting change first:** `dataset_builder` now writes **`source`** into each
+`eval_buckets.json` row — `"primary"` (the corpus being trained on, Set B) or `"eval_only"` (the
+retained comparison corpus, Set A). Both #6 and #7 read it. It is *recorded* rather than inferred
+from the `EP` label prefix because prefix-sniffing silently mis-splits the moment a batch reuses a
+prefix, and mis-splitting is the one thing the whole exercise exists to prevent. A prefix fallback
+remains for round 1's existing sidecar, which predates the field — verified to reproduce the
+recorded split exactly.
+
+**#6** — `compute_metrics` returns `wer` (blended) **plus** `wer_r1` and `wer_b3`. Checkpoint
+selection is deliberately unchanged: `metric_for_best_model` stays on the blend, because a
+checkpoint should be good at both. These make the blend's *composition* visible.
+
+⚠️ **Ordering is load-bearing.** The per-source indices are built **before**
+`dataset.map(remove_columns=...)`, which strips `sentence`. Built after, there would be nothing left
+to align the sidecar against. Asserted in the test.
+
+Why it matters at all: with Set B at 341 of 587 clips and Set A at 246, a 4-point gain on B against
+a 4-point loss on A reads as `0.58 × (−4) + 0.42 × (+4) = −0.6` — a *small improvement*. That is
+forgetting, displayed as progress. And it now shows at **epoch 1 (~1.5 h in)** rather than after the
+run, which is the difference between wasting one epoch and wasting ~4.4 h of A10G. Zero extra GPU:
+the predictions already exist, this slices them.
+
+**#7** — `evaluate(which, dataset_path, model_path)`, both falling back to today's behaviour.
+Reports overall, per bucket, **per source**, and **source × bucket** — the last being the table the
+success criteria are actually read from (`r1/*` = retention, `b3/code_switch` = the gain). The saved
+JSON now records `dataset_path`, `which`, and per-source clip counts, so a results file is
+interpretable on its own rather than only alongside whatever the config said at the time.
+
+⚠️ Cross-corpus buckets now carry a printed warning. A `code_switch` figure blending round 1's 52
+clips with Batch 3's 132 is not a comparison — it is an average of two different questions.
+
+### 🐞 Two bugs caught in my own #7 changes
+- **The sidecar was still being read from `cfg["data"]["dataset_path"]`** while the dataset itself
+  became overridable. Any `--dataset-path` run would have loaded the *wrong* `eval_buckets.json`,
+  failed the length/sentence alignment check, and **silently dropped all bucket and source
+  reporting** — printing only overall WER, which is exactly the number the plan says not to trust.
+  Now reads from `ds_path`.
+- **`run_model(model_path, label)` shadowed the new `model_path` argument.** Correct as written, but
+  two different meanings for one name in nested scopes is how the next edit introduces a real bug.
+  Renamed to `path`.
+
+**#8** — `train`'s timeout 8 h → 12 h; `evaluate`'s 2 h left alone (three short runs, not one long
+one). The rationale is recorded beside it: the overrun is *total*, not partial — the adapter, the
+merged model and the only `volume.commit()` all happen after training, and nothing commits during
+it. Modal bills time used, not the ceiling, so the margin is free.
 
 ### ✅ ORDERING CONSTRAINT RESOLVED — #5 unblocks #9
 `ADAPTER_PATH` is `/data/model/whisper-urdu-lora-adapter`, which is *also* where round 1's adapter

@@ -76,7 +76,15 @@ image = (
 @app.function(
     image=image,
     gpu="A10G",          # 24GB VRAM — perfect for Whisper medium
-    timeout=60 * 60 * 8, # 8 hour max (10hrs audio ≈ 3-4hrs training)
+    # 12 h. Round 2 estimates ~6 h (4.4 h training at 3x258 steps, + 3 generate-eval
+    # passes over 587 clips, + feature extraction on 8.8k clips = 3.9x round 1's,
+    # + merging and writing a 6.17 GB model) — a ~30% margin on a figure INFERRED
+    # from round 1's throughput, not measured for this run.
+    # Raised because the overrun is total, not partial: the adapter, the merged
+    # model and the only volume.commit() all happen AFTER training, so a kill at
+    # 7h50m leaves no deliverable and nothing was committed during training either.
+    # Modal bills time used, not the ceiling, so the margin is free.
+    timeout=60 * 60 * 12,
     volumes={VOLUME_PATH: volume},
     memory=32768,         # 32GB RAM
 )
@@ -88,6 +96,7 @@ def train():
       set    → CONTINUE training that existing adapter (round 2)
     """
     import os
+    import json
     import yaml
     import torch
     import numpy as np
@@ -298,6 +307,46 @@ def train():
         batch["labels"] = processor.tokenizer(batch["sentence"]).input_ids
         return batch
 
+    # ── Per-source eval indices (the forgetting tripwire) ──────────
+    # Round 2's eval split spans TWO corpora that measure opposite things: the
+    # batch under training, and round 1's retained episodes. A single blended WER
+    # can report a wash while the run trades old competence for new — improve the
+    # larger half by 4 points, lose 4 on the smaller, and the average barely
+    # moves. So the split is reported per source EVERY epoch, which is also the
+    # earliest point the learning rate can be judged.
+    #
+    # Must be built BEFORE .map() below, which drops `sentence`.
+    SOURCE_METRIC = {"primary": "b3", "eval_only": "r1"}
+    eval_src_idx: dict[str, list[int]] = {}
+    _sidecar = os.path.join(cfg["data"]["dataset_path"], "eval_buckets.json")
+    if os.path.exists(_sidecar):
+        with open(_sidecar, encoding="utf-8") as f:
+            _bmeta = json.load(f)
+        _eval_sentences = dataset["eval"]["sentence"]
+        if len(_bmeta) != len(_eval_sentences):
+            print(f"⚠️  eval_buckets.json has {len(_bmeta)} rows != {len(_eval_sentences)} "
+                  "eval clips — per-source WER DISABLED (rebuild the dataset).")
+        elif any(_bmeta[i].get("sentence") != _eval_sentences[i]
+                 for i in range(len(_eval_sentences))):
+            print("⚠️  eval_buckets.json is misaligned with the eval split — "
+                  "per-source WER DISABLED.")
+        else:
+            for i, m in enumerate(_bmeta):
+                # Fall back to the label prefix for datasets built before `source`
+                # existed (round 1's), so this degrades rather than crashing.
+                src = m.get("source") or (
+                    "eval_only" if str(m.get("episode", "")).startswith("EP") else "primary"
+                )
+                key = SOURCE_METRIC.get(src, src)
+                eval_src_idx.setdefault(key, []).append(i)
+            print("   eval sources: " + ", ".join(
+                f"wer_{k}={len(v)} clips" for k, v in sorted(eval_src_idx.items())))
+            if len(eval_src_idx) < 2:
+                print("   (single-corpus eval split — wer_* will mirror the blended wer)")
+    else:
+        print("⚠️  No eval_buckets.json — per-source WER DISABLED, so a Set A "
+              "regression would be invisible until after the run.")
+
     print("⚙️  Preprocessing audio features...")
     dataset = dataset.map(
         prepare_dataset,
@@ -315,7 +364,19 @@ def train():
         pred_str = processor.batch_decode(pred_ids, skip_special_tokens=True)
         label_str = processor.batch_decode(label_ids, skip_special_tokens=True)
         wer = 100 * wer_metric.compute(predictions=pred_str, references=label_str)
-        return {"wer": wer}
+        metrics = {"wer": wer}
+        # Per-corpus WER alongside the blend. `metric_for_best_model` stays on the
+        # blended `wer` on purpose — a checkpoint should be good at BOTH — these
+        # only make the blend's composition visible. Costs no extra GPU: the
+        # predictions already exist, this slices them by index.
+        for key, idxs in eval_src_idx.items():
+            if not idxs:
+                continue
+            metrics[f"wer_{key}"] = 100 * wer_metric.compute(
+                predictions=[pred_str[i] for i in idxs],
+                references=[label_str[i] for i in idxs],
+            )
+        return metrics
 
     # ── Training Arguments ─────────────────────────────────────────
     training_args = Seq2SeqTrainingArguments(
@@ -381,17 +442,31 @@ def train():
     volumes={VOLUME_PATH: volume},
     memory=32768,
 )
-def evaluate(which: str = "both"):
+def evaluate(which: str = "both", dataset_path: str = "", model_path: str = ""):
     """
-    Compute WER on the held-out eval split.
+    Compute WER on a held-out eval split.
 
     which = "base"      → frozen base model only (the baseline)
             "finetuned" → fine-tuned model only
             "both"      → run both over the SAME clips and print side by side
 
+    dataset_path  eval set to score. Defaults to config's data.dataset_path.
+                  Pass it explicitly to score a model against a set the current
+                  config does not name — e.g. reproducing round 1's number on the
+                  ORIGINAL /processed/dataset artifact, so a mismatch cannot be
+                  blamed on a rebuilt copy. Also makes a finished run
+                  self-describing instead of only interpretable alongside
+                  whatever the config said at the time.
+    model_path    model for the "finetuned" slot. Defaults to FINAL_MODEL_PATH
+                  (round 1's). REQUIRED to score round 2, whose merged model is
+                  at a run_tag-suffixed path this function would otherwise never
+                  look at.
+
     Run:
-      modal run modal_app.py::evaluate                 # both
-      modal run modal_app.py::evaluate --which base    # baseline only
+      modal run modal_app.py::evaluate                          # both, config's dataset
+      modal run modal_app.py::evaluate --which base             # baseline only
+      modal run modal_app.py::evaluate --dataset-path /data/processed/dataset_r2 \
+          --model-path /data/model/whisper-urdu-r2-final --which finetuned
     """
     import os
     import re
@@ -408,19 +483,35 @@ def evaluate(which: str = "both"):
     language = cfg["model"]["language"]
     task = cfg["model"]["task"]
 
-    # ── Load the SAME held-out eval split used in training ──────────
-    dataset = load_from_disk(cfg["data"]["dataset_path"])
+    # ── Load the held-out eval split ────────────────────────────────
+    ds_path = dataset_path or cfg["data"]["dataset_path"]
+    ft_path = model_path or FINAL_MODEL_PATH
+    dataset = load_from_disk(ds_path)
     dataset = dataset.cast_column("audio", Audio(sampling_rate=16000))
     eval_ds = dataset["eval"]
     references = [s for s in eval_ds["sentence"]]
     print(f"📏 Evaluating on {len(eval_ds)} held-out clips.")
+    print(f"   dataset : {ds_path}"
+          f"{'' if dataset_path else '   (from config)'}")
+    if which in ("finetuned", "both"):
+        print(f"   model   : {ft_path}"
+              f"{'' if model_path else '   (default — round 1)'}")
 
-    # ── Per-bucket eval subsets (from dataset_builder's sidecar) ────
-    # Lets us report WER separately for code-switching / spiritual-term clips,
-    # where fine-tuning's benefit concentrates but aggregate WER hides it.
+    # ── Eval subsets (from dataset_builder's sidecar) ───────────────
+    # buckets  — code_switch / spiritual_term, where fine-tuning's benefit
+    #            concentrates but aggregate WER hides it.
+    # sources  — WHICH CORPUS a clip came from. Round 2's split holds two, and
+    #            a bucket computed ACROSS them is meaningless: a `code_switch`
+    #            number blending round 1's 52 clips with Batch 3's 132 is not a
+    #            comparison, it is an average of two different questions. So
+    #            source x bucket is reported too, and that is what criterion 3
+    #            (code_switch on Set B, r1 vs r2) is actually read from.
     BUCKETS = ["nastaliq_only", "code_switch", "spiritual_term"]
+    SOURCE_LABEL = {"primary": "b3", "eval_only": "r1"}
     bucket_indices: dict[str, list[int]] = {}
-    sidecar = os.path.join(cfg["data"]["dataset_path"], "eval_buckets.json")
+    source_indices: dict[str, list[int]] = {}
+    source_bucket_indices: dict[str, list[int]] = {}
+    sidecar = os.path.join(ds_path, "eval_buckets.json")
     if os.path.exists(sidecar):
         with open(sidecar, encoding="utf-8") as f:
             bmeta = json.load(f)
@@ -433,6 +524,24 @@ def evaluate(which: str = "both"):
             for b in BUCKETS:
                 bucket_indices[b] = [i for i, m in enumerate(bmeta) if b in m["buckets"]]
             print("   buckets: " + ", ".join(f"{b}={len(bucket_indices[b])}" for b in BUCKETS))
+
+            for i, m in enumerate(bmeta):
+                # Prefix fallback for datasets built before `source` existed.
+                raw = m.get("source") or (
+                    "eval_only" if str(m.get("episode", "")).startswith("EP") else "primary"
+                )
+                src = SOURCE_LABEL.get(raw, raw)
+                source_indices.setdefault(src, []).append(i)
+                for b in BUCKETS:
+                    if b in m["buckets"]:
+                        source_bucket_indices.setdefault(f"{src}/{b}", []).append(i)
+            if len(source_indices) > 1:
+                print("   sources: " + ", ".join(
+                    f"{k}={len(v)}" for k, v in sorted(source_indices.items())))
+            else:
+                # Single corpus: the per-source number would just repeat overall.
+                source_indices, source_bucket_indices = {}, {}
+                print("   sources: single corpus — per-source breakdown not reported")
     else:
         print("ℹ️  No eval_buckets.json found — reporting overall WER only.")
 
@@ -446,12 +555,14 @@ def evaluate(which: str = "both"):
         text = re.sub(_punct, " ", text)
         return re.sub(r"\s+", " ", text).strip()
 
-    def run_model(model_path: str, label: str) -> dict:
-        print(f"\n🔎 Loading {label}: {model_path}")
+    # `path`, not `model_path`: the outer scope now has a `model_path` argument
+    # and shadowing it here would make the two impossible to tell apart.
+    def run_model(path: str, label: str) -> dict:
+        print(f"\n🔎 Loading {label}: {path}")
         processor = WhisperProcessor.from_pretrained(
-            model_path, language=language, task=task
+            path, language=language, task=task
         )
-        model = WhisperForConditionalGeneration.from_pretrained(model_path)
+        model = WhisperForConditionalGeneration.from_pretrained(path)
         model = model.to("cuda").eval()
         forced_decoder_ids = processor.get_decoder_prompt_ids(
             language=language, task=task
@@ -482,32 +593,39 @@ def evaluate(which: str = "both"):
             predictions=[normalize(p) for p in preds],
             references=[normalize(r) for r in references],
         )
-        # Per-bucket normalized WER over the sidecar subsets.
-        buckets_wer = {}
-        for b, idxs in bucket_indices.items():
-            if not idxs:
-                continue
-            buckets_wer[b] = {
+        # Normalized WER over an arbitrary index subset.
+        def subset_wer(idxs: list[int]) -> dict:
+            return {
                 "n": len(idxs),
                 "norm_wer": 100 * wer_metric.compute(
                     predictions=[normalize(preds[i]) for i in idxs],
                     references=[normalize(references[i]) for i in idxs],
                 ),
             }
+
+        buckets_wer = {b: subset_wer(i) for b, i in bucket_indices.items() if i}
+        sources_wer = {s: subset_wer(i) for s, i in source_indices.items() if i}
+        source_buckets_wer = {k: subset_wer(i) for k, i in source_bucket_indices.items() if i}
+
         del model
         torch.cuda.empty_cache()
         print(f"   → {label}: raw WER {raw_wer:.2f}% | normalized WER {norm_wer:.2f}%")
-        return {"label": label, "raw_wer": raw_wer, "norm_wer": norm_wer,
-                "buckets": buckets_wer, "predictions": preds}
+        return {"label": label, "model_path": path,
+                "raw_wer": raw_wer, "norm_wer": norm_wer,
+                "buckets": buckets_wer, "sources": sources_wer,
+                "source_buckets": source_buckets_wer, "predictions": preds}
 
     results = {}
     if which in ("base", "both"):
         results["base"] = run_model(base_name, f"BASE ({base_name})")
     if which in ("finetuned", "both"):
-        if not os.path.exists(FINAL_MODEL_PATH):
-            print(f"⚠️  Fine-tuned model not found at {FINAL_MODEL_PATH} — run train first.")
+        if not os.path.exists(ft_path):
+            # Loud, and it names the path: the likeliest cause is a run_tag'd
+            # model being looked for at round 1's default location.
+            print(f"⚠️  Fine-tuned model not found at {ft_path} — pass --model-path, "
+                  "or run train first.")
         else:
-            results["finetuned"] = run_model(FINAL_MODEL_PATH, "FINE-TUNED")
+            results["finetuned"] = run_model(ft_path, f"FINE-TUNED ({os.path.basename(ft_path)})")
 
     # ── Report ─────────────────────────────────────────────────────
     print("\n" + "=" * 60)
@@ -540,6 +658,41 @@ def evaluate(which: str = "both"):
             ft_s = f"{ft_w:.2f}" if ft_w is not None else "-"
             delta_s = f"{base_w - ft_w:+.2f}" if (base_w is not None and ft_w is not None) else "-"
             print(f"  {b:<16}{n:>6}{base_s:>10}{ft_s:>12}{delta_s:>9}")
+        if source_indices:
+            print("  ⚠️  These span BOTH corpora — see the per-source tables below. A"
+                  "\n      bucket averaged across two corpora is not a comparison.")
+        print("=" * 60)
+
+    # ── Per-source breakdown (round 2: Set A retention vs Set B gain) ──
+    def _row(label: str, key: str, getter: str) -> None:
+        base_x = results.get("base", {}).get(getter, {}).get(key)
+        ft_x = results.get("finetuned", {}).get(getter, {}).get(key)
+        n = (base_x or ft_x or {}).get("n")
+        if n is None:
+            return
+        bw = base_x["norm_wer"] if base_x else None
+        fw = ft_x["norm_wer"] if ft_x else None
+        bs = f"{bw:.2f}" if bw is not None else "-"
+        fs = f"{fw:.2f}" if fw is not None else "-"
+        ds = f"{bw - fw:+.2f}" if (bw is not None and fw is not None) else "-"
+        print(f"  {label:<22}{n:>6}{bs:>10}{fs:>12}{ds:>9}")
+
+    if source_indices:
+        print("\n  PER-SOURCE normalized WER  (never average these together)")
+        print(f"  {'source':<22}{'n':>6}{'base':>10}{'finetuned':>12}{'delta':>9}")
+        print("-" * 59)
+        for s in sorted(source_indices):
+            _row(f"{s}  ({'round 1' if s == 'r1' else 'this batch'})", s, "sources")
+        print("=" * 60)
+
+        print("\n  SOURCE x BUCKET normalized WER")
+        print("  This is the table the success criteria are read from: r1/* is")
+        print("  retention (criteria 1-2), b3/code_switch is the gain (criterion 3).")
+        print(f"  {'source / bucket':<22}{'n':>6}{'base':>10}{'finetuned':>12}{'delta':>9}")
+        print("-" * 59)
+        for s in sorted(source_indices):
+            for b in BUCKETS:
+                _row(f"{s} / {b}", f"{s}/{b}", "source_buckets")
         print("=" * 60)
 
     # Persist results to the volume for later reference
@@ -549,6 +702,12 @@ def evaluate(which: str = "both"):
         for k, v in results.items()
     }
     out["n_clips"] = len(eval_ds)
+    # Record WHAT was scored, not just the scores. Both inputs are now
+    # overridable, so a bare number is not reproducible six weeks later —
+    # the same file would otherwise be ambiguous between Set A, Set B and both.
+    out["dataset_path"] = ds_path
+    out["which"] = which
+    out["source_clip_counts"] = {s: len(i) for s, i in source_indices.items()}
     # run_tag-scoped: round 1's eval_results.json holds the 18.57% / 10.50%
     # baseline this project is measured against, and an untagged round-2 eval
     # would overwrite it. It is also the one artifact here that cannot be

@@ -215,10 +215,19 @@ def build_dataset(
     dataset.save_to_disk(output_path)
 
     # Sidecar bucket tags for the evaluator (aligned to eval row order).
+    #
+    # `source` records WHICH CORPUS each eval clip came from:
+    #   "primary"   — the corpus being trained on (round 2: Batch 3, i.e. Set B)
+    #   "eval_only" — a retained comparison corpus  (round 2: round 1, i.e. Set A)
+    # Recorded rather than inferred from the label prefix: prefix-sniffing ("EP"
+    # means round 1) works today but silently mis-splits the moment a batch reuses
+    # a prefix, and the whole point of the split is that the two corpora's WERs
+    # must never be averaged together.
     eval_buckets = [
         {"episode": episode_of(s),
          "sentence": s["transcript"],
-         "buckets": buckets_for(s["transcript"], terms)}
+         "buckets": buckets_for(s["transcript"], terms),
+         "source": "eval_only" if episode_of(s) in eval_only_by_ep else "primary"}
         for s in eval_samples
     ]
     with open(Path(output_path) / "eval_buckets.json", "w", encoding="utf-8") as f:
