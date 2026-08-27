@@ -20,6 +20,7 @@ Layout for batch "batch3":
     data/batch3/asr_transcripts/         stage 3+4  pre-alignment MODEL output (unreviewed;
                                                     NOT round-1's human-verified
                                                     raw_transcripts/ -- see transcript_dir)
+    data/batch3/hadees_snips/            downstream  scripts/hadees_snips.py -> frames + manifest
     data/processed/Batch3/               stage 5  batch_srt_prep.py -> manifest.json
 """
 import re
@@ -113,6 +114,18 @@ class BatchPaths:
         output that is wrong while every check still reports pass.
         """
         return self.root / "qa_reports"
+
+    @property
+    def hadees_snips_dir(self) -> Path:
+        """Downstream output of scripts/hadees_snips.py: still frames of quoted
+        Quran/hadees plus manifest.csv and review.html.
+
+        Batch-scoped like everything else here for one specific reason: that script
+        APPENDS to manifest.csv rather than rewriting it, so a stale default would not
+        just misplace files -- it would interleave two batches' rows in one manifest
+        with no error and no way to tell them apart afterwards.
+        """
+        return self.root / "hadees_snips"
 
     @property
     def processed_dir(self) -> Path:
