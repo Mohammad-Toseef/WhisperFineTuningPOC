@@ -265,6 +265,42 @@ Combined eval buckets: **nastaliq_only 531 (73.8%)** / code_switch 189 (26.2%) /
 spiritual_term 250 (34.7%) — close to Batch 3's own distribution, which is what the primary goal
 needs.
 
+#### ✅ BUILT AND VERIFIED (2026-08-28) — every predicted number came out exactly
+
+`data/processed/dataset_r2`, **4.7 GB** on disk (over the 4.4 GB estimate because `datasets` embeds
+the audio as bytes rather than referencing the wavs). Uploaded to `/processed/dataset_r2`.
+
+| check | result |
+|---|---|
+| splits | **8,123 train / 720 eval** (8% eval) |
+| train episodes | **88** = 96 Batch-3 minus the 8 held out |
+| eval buckets | 531 / 189 / 250 — as predicted above |
+| held-out episodes leaked into train | **NONE** |
+| eval episode set == the 15 pinned | **True** — none missing, none extra |
+| round-1 episodes in train | **NONE** — all 2,011 unpinned clips dropped and logged |
+| eval by corpus | Set B 474 / 8 eps · Set A 246 / 7 eps |
+| sidecar alignment | 720 rows, `source` on every row, 474 primary / 246 eval_only |
+| volume config == local config | **identical** (fetched back with `modal volume get` and diffed) |
+| round-1 artifacts after upload | `model/whisper-urdu-lora-adapter` + `model/whisper-urdu-final` intact |
+
+★ **Set A's `code_switch` bucket came out at 52 clips — the exact count reproduced from round 1's
+pinned eval set (194/52/129).** Independent confirmation that Set A is compositionally identical to
+what produced round 1's **10.50%**, so the r1-vs-r2 comparison rests on a measurement rather than an
+assumption.
+
+Two operational notes worth keeping:
+
+- **`dataset_builder` must run under `.\venv\Scripts\python.exe`.** The `python` on PATH has `torch`
+  but not `datasets`, so the first launch died instantly on `ModuleNotFoundError`. The pre-flight
+  suite passes under either interpreter (it needs only `yaml` and `torch`), which is why this did not
+  surface until the build.
+- **The `modal` CLI on PATH belongs to an unrelated project** —
+  `SRTTimeStampPOC\.venv\Scripts\modal.exe`, client 1.5.1. It is what round 1 used, so it was not
+  changed mid-run, but it means this project's auth and client version depend on another project's
+  venv. Worth pinning `modal` into `WhisperFineTuningPOC\venv`.
+- `modal volume get` needs a **Windows-style** destination path; a git-bash-style `/c/...` path fails
+  with a bare `No such file or directory`.
+
 ⚠️ The eval split is **2.9× round 1's 246 clips**, and in-training eval uses
 `predict_with_generate`. That is the main new wall-clock cost; it is why the epoch count comes
 down rather than up.
@@ -295,7 +331,7 @@ Set A and Set B go into **ONE combined eval split** (720 clips) in the round-2 d
 | gradient_accumulation_steps | 4 | 4 | effective batch **32** |
 | steps/epoch | 63 | **254** | ceil(8123/32) |
 | max_steps | 567 (~9 ep) | **762 (~3 ep)** | warm start + 4× data ⇒ far fewer epochs |
-| warmup_steps | 57 | **77** | ~10% |
+| warmup_steps | 57 | **76** | 9.97% of 762 |
 | eval_steps / save_steps | 63 / 63 | **254 / 254** | once per epoch; save%eval==0 so `load_best` works |
 | fp16 / gradient_checkpointing | true / true | unchanged | |
 | metric_for_best_model | wer | wer (blended) | plus `wer_r1` / `wer_b3` reported, see below |
