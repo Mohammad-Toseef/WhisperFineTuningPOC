@@ -465,6 +465,13 @@ def train():
     print(f"💾 Saving LoRA adapter to {out_adapter} ...")
     model.save_pretrained(out_adapter)
     processor.save_pretrained(out_adapter)
+    # Commit the ADAPTER before attempting the merge. The adapter is the only
+    # irreplaceable output — the merged model is derivable from it, but nothing
+    # regenerates the adapter except another full training run. Committing once at
+    # the very end meant a failure in merge_and_unload() or in writing the 6.2 GB
+    # merged model would discard hours of training that had already succeeded.
+    volume.commit()
+    print(f"   ✅ adapter committed — training is now safe even if the merge fails")
 
     print("🔀 Merging adapter into base model for production format...")
     merged_model = model.merge_and_unload()
@@ -564,8 +571,16 @@ def evaluate(which: str = "both", dataset_path: str = "", model_path: str = ""):
         if len(bmeta) != len(references):
             print(f"⚠️  eval_buckets.json has {len(bmeta)} rows != {len(references)} eval "
                   "clips — skipping per-bucket WER (rebuild the dataset).")
+            bmeta = []
         elif any(bmeta[i].get("sentence") != references[i] for i in range(len(references))):
             print("⚠️  eval_buckets.json is misaligned with the eval split — skipping per-bucket WER.")
+            # MUST discard it. The predictions sidecar decides whether to attach
+            # episode/source labels by comparing LENGTHS, and a sidecar that is the
+            # right length but the wrong content passes that test — so every row
+            # would get a confident, wrong label. Wrong labels are worse than none:
+            # they would have someone reading another episode's output believing it
+            # was B3039's.
+            bmeta = []
         else:
             for b in BUCKETS:
                 bucket_indices[b] = [i for i, m in enumerate(bmeta) if b in m["buckets"]]
