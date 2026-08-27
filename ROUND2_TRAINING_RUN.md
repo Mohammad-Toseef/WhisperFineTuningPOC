@@ -858,6 +858,16 @@ Verified clean, no changes needed:
 `Trainer(tokenizer=...)` were renamed in transformers 4.46.** Correct under the current pin; they
 break the moment the pin moves.
 
+### ✅ The checks now live in the repo, not in a scratchpad
+`tests/test_round2_preflight.py` — **15 checks, read-only, no GPU, seconds.**
+**Re-run after ANY edit to `training_config.yaml` or `modal_app.py`:**
+```
+python tests/test_round2_preflight.py      # no pytest needed
+```
+Ships a `__main__` runner because neither venv has pytest, and skips rather than fails when the
+gitignored manifests are absent. Verified with a **mutation-based negative control: 17 deliberate
+breakages introduced, 17 caught** — a test that cannot fail is worthless.
+
 ### What to read in the first minute of the run
 `train()` prints these before any real GPU time is spent, and they are the confirmation that resume,
 `run_tag` and the dataset all point where intended:

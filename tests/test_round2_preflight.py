@@ -1,0 +1,345 @@
+"""Pre-flight checks for the round-2 training run. READ-ONLY, no GPU, seconds to run.
+
+WHY THIS EXISTS
+---------------
+Every failure this guards against is one that costs GPU time to discover. A typo'd
+key in training_config.yaml, a step count that no longer matches the manifest, or
+an output path that collides with round 1's all surface only *after* the container
+has pulled a 6 GB model -- or worse, not at all.
+
+RUN IT AFTER ANY EDIT TO training_config.yaml OR modal_app.py, and before launching:
+
+    python tests/test_round2_preflight.py      # no pytest needed
+    pytest tests/test_round2_preflight.py      # if pytest is installed
+
+Tests that need the gitignored manifests SKIP rather than fail, so this still runs
+on a fresh clone.
+
+Two of the checks below are regressions for real bugs found in the 2026-08-27
+pre-flight review (commit 3aed2e2), both silent:
+  * a right-length/wrong-content eval_buckets.json mislabelled every prediction row
+  * a merge failure discarded the adapter, the only irreplaceable output
+
+They assert over COMMENT-STRIPPED code and the AST on purpose. The first versions
+string-matched the source and reported false failures, because prose in the
+comments contains the same identifiers as the statements being ordered.
+"""
+import ast
+import json
+import math
+import re
+import sys
+from pathlib import Path
+
+try:
+    import pytest
+except ImportError:  # plain-python fallback; see __main__ below
+    pytest = None
+
+try:
+    import yaml
+except ImportError:
+    yaml = None
+
+ROOT = Path(__file__).resolve().parents[1]
+MODAL_APP = ROOT / "modal_app.py"
+CONFIG = ROOT / "config" / "training_config.yaml"
+B3_MANIFEST = ROOT / "data" / "processed" / "Batch3" / "manifest_reviewed.json"
+R1_MANIFEST = ROOT / "data" / "processed" / "manifest_reviewed.json"
+
+#: The round-2 holdout, pinned. Kept here as well as in --eval-episodes so a
+#: drift between the two is a test failure rather than a silent mismatch.
+SET_B = ["B3013", "B3017", "B3029", "B3031", "B3039", "B3051", "B3063", "B3076"]
+SET_A = ["EP5_vwzNL2oziZs", "EP6_SrVnpBqd7bI", "EP34_h87EJF0Zvco", "EP41_mBtP9NKha1g",
+         "EP43_m8-37sgUwUQ", "EP44_paAJQ3OKB-8", "EP47_a0NiZST0S6Q"]
+EPOCHS = 3
+
+
+class Skipped(Exception):
+    """Raised when a prerequisite is absent and pytest is not available."""
+
+
+def skip(reason: str):
+    if pytest is not None:
+        pytest.skip(reason)
+    raise Skipped(reason)
+
+
+def load_cfg() -> dict:
+    if yaml is None:
+        skip("pyyaml not installed")
+    return yaml.safe_load(CONFIG.read_text(encoding="utf-8"))
+
+
+def load_manifest(path: Path) -> list:
+    if not path.exists():
+        skip(f"{path.relative_to(ROOT)} not present (gitignored data)")
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def episode_of(entry: dict) -> str:
+    return Path(entry["audio_path"].replace("\\", "/")).parent.name
+
+
+def code_lines(block: str) -> list[str]:
+    """Source with comments and blank lines removed.
+
+    Ordering assertions must reason about STATEMENTS. `merge_and_unload` appears in
+    a comment above the commit it is meant to be ordered after, so an index search
+    over raw source finds the comment and reports a failure that does not exist.
+    """
+    out = []
+    for line in block.splitlines():
+        stripped = line.split("#", 1)[0].strip()
+        if stripped:
+            out.append(stripped)
+    return out
+
+
+def train_block(src: str) -> str:
+    return src[src.index("def train("):src.index("# ── Evaluation")]
+
+
+# ── config ────────────────────────────────────────────────────────────────────
+def test_round2_switches_are_on():
+    """run_tag / resume / dataset must all point at round 2, or this is not round 2."""
+    cfg = load_cfg()
+    assert cfg["training"].get("run_tag") == "r2", cfg["training"].get("run_tag")
+    assert cfg["lora"].get("resume_from_adapter") == "/data/model/whisper-urdu-lora-adapter"
+    assert cfg["data"]["dataset_path"] == "/data/processed/dataset_r2"
+
+
+def test_every_config_key_the_code_reads_exists():
+    """The highest-value check here: a missing key dies AFTER a 6 GB model load.
+
+    Scans modal_app.py for t_cfg["..."] / l_cfg["..."] / cfg["a"]["b"] and resolves
+    each against the real yaml.
+    """
+    cfg = load_cfg()
+    src = MODAL_APP.read_text(encoding="utf-8")
+    missing = []
+    for alias, section in (("t_cfg", cfg["training"]), ("l_cfg", cfg["lora"])):
+        for m in re.finditer(alias + r'\["([^"]+)"\]', src):
+            if m.group(1) not in section:
+                missing.append(f'{alias}["{m.group(1)}"]')
+    for m in re.finditer(r'cfg\["(\w+)"\]\["(\w+)"\]', src):
+        a, b = m.group(1), m.group(2)
+        if a not in cfg or b not in cfg[a]:
+            missing.append(f'cfg["{a}"]["{b}"]')
+    assert not missing, f"config keys read by the code but absent from the yaml: {sorted(set(missing))}"
+
+
+def test_learning_rate_is_a_float_not_a_string():
+    """YAML reads 5.0e-6 as a float but a bare 5e-6 as the STRING '5e-6', which
+    would reach the optimizer as a string."""
+    lr = load_cfg()["training"]["learning_rate"]
+    assert isinstance(lr, float), f"learning_rate parsed as {type(lr).__name__}: {lr!r}"
+
+
+def test_checkpoint_selection_is_coherent():
+    cfg = load_cfg()["training"]
+    # compute_metrics returns "wer"; the Trainer looks for "eval_" + this name.
+    assert cfg["metric_for_best_model"] == "wer", cfg["metric_for_best_model"]
+    assert cfg["greater_is_better"] is False, "WER: lower is better"
+    assert cfg["load_best_model_at_end"] is True
+    # load_best_model_at_end cannot resolve a best checkpoint unless saves land on evals.
+    assert cfg["save_steps"] % cfg["eval_steps"] == 0
+
+
+def test_training_arguments_are_valid_for_the_pinned_transformers():
+    """`evaluation_strategy` and `tokenizer=` were renamed in 4.46. They are correct
+    under the <4.46 pin, so this asserts the PIN still matches the ARGS -- if the pin
+    moves, this fails instead of the run failing."""
+    src = MODAL_APP.read_text(encoding="utf-8")
+    pinned_below_446 = 'transformers>=4.40.0,<4.46' in src
+    uses_old_names = ("evaluation_strategy=" in src) or ("tokenizer=processor" in src)
+    assert not uses_old_names or pinned_below_446, (
+        "modal_app.py uses evaluation_strategy= / tokenizer= but transformers is no "
+        "longer pinned below 4.46 — rename to eval_strategy= / processing_class=")
+
+
+# ── step schedule vs the real data ────────────────────────────────────────────
+def test_step_schedule_matches_the_manifest():
+    """max_steps must be a whole number of epochs over the ACTUAL train count.
+
+    Recomputed from the manifest rather than trusted, because changing the eval
+    holdout changes the train count and therefore every step number.
+    """
+    cfg = load_cfg()["training"]
+    rev = load_manifest(B3_MANIFEST)
+    setb = set(SET_B)
+    n_train = sum(1 for s in rev if episode_of(s).split("_")[0] not in setb)
+    eff = cfg["per_device_train_batch_size"] * cfg["gradient_accumulation_steps"]
+    steps_per_epoch = math.ceil(n_train / eff)
+    assert cfg["eval_steps"] == steps_per_epoch, (
+        f"eval_steps {cfg['eval_steps']} != one epoch ({steps_per_epoch}) "
+        f"for {n_train} train clips at effective batch {eff}")
+    assert cfg["max_steps"] == steps_per_epoch * EPOCHS, (
+        f"max_steps {cfg['max_steps']} != {EPOCHS} epochs ({steps_per_epoch * EPOCHS})")
+    warmup_frac = cfg["warmup_steps"] / cfg["max_steps"]
+    assert 0.08 <= warmup_frac <= 0.12, f"warmup is {warmup_frac:.1%} of the run"
+
+
+def test_all_eval_episodes_resolve():
+    """A typo in --eval-episodes is rejected by dataset_builder, but only after the
+    manifests are loaded. Catch it here instead."""
+    rev = load_manifest(B3_MANIFEST)
+    r1 = load_manifest(R1_MANIFEST)
+    b3_labels = {episode_of(s).split("_")[0] for s in rev}
+    for label in SET_B:
+        assert label in b3_labels, f"Set B episode {label} is not in the Batch 3 manifest"
+    r1_folders = {episode_of(s) for s in r1}
+    for folder in SET_A:
+        assert folder in r1_folders, f"Set A episode {folder} is not in the round-1 manifest"
+
+
+def test_eval_split_is_two_distinct_corpora():
+    """Set A and Set B must not overlap, or the retention guard measures training data."""
+    rev = load_manifest(B3_MANIFEST)
+    r1 = load_manifest(R1_MANIFEST)
+    b3_eval = {episode_of(s) for s in rev if episode_of(s).split("_")[0] in set(SET_B)}
+    r1_eval = {episode_of(s) for s in r1 if episode_of(s) in set(SET_A)}
+    assert b3_eval and r1_eval
+    assert not (b3_eval & r1_eval), "an episode is in both eval sets"
+
+
+# ── output paths ──────────────────────────────────────────────────────────────
+def _paths_module():
+    if str(ROOT) not in sys.path:
+        sys.path.insert(0, str(ROOT))
+    try:
+        import modal_app
+    except Exception as exc:  # modal not installed, or import-time failure
+        skip(f"cannot import modal_app ({type(exc).__name__}: {exc})")
+    return modal_app
+
+
+def test_round2_writes_nowhere_round1_lives():
+    """The whole point of run_tag. A collision here would have round 2 destroy the
+    artifact it resumes from."""
+    m = _paths_module()
+    cfg = load_cfg()
+    tag = cfg["training"]["run_tag"]
+    round1 = {m.adapter_path(""), m.final_model_path(""), "/data/processed/dataset",
+              "/data/checkpoints/whisper-large-v3-urdu", "/data/logs"}
+    round2 = {m.adapter_path(tag), m.final_model_path(tag),
+              cfg["data"]["dataset_path"], cfg["training"]["output_dir"],
+              cfg["training"]["logging_dir"]}
+    clash = round1 & round2
+    assert not clash, f"round-2 output collides with a round-1 path: {sorted(clash)}"
+
+
+def test_resume_source_is_not_this_runs_output():
+    """train() raises on this, but failing here costs no container start."""
+    m = _paths_module()
+    cfg = load_cfg()
+    resume = cfg["lora"]["resume_from_adapter"]
+    assert resume == m.adapter_path(""), "resume source should be round 1's adapter"
+    assert resume != m.adapter_path(cfg["training"]["run_tag"])
+
+
+def test_eval_result_filenames_are_distinct_per_model():
+    """Three eval runs share one dataset. Without a per-model label they share one
+    filename too, and only the last survives -- losing the baselines the round is
+    judged against."""
+    m = _paths_module()
+    tag = load_cfg()["training"]["run_tag"]
+    names = {m.eval_results_path(tag, lbl) for lbl in
+             ("base", "whisper-urdu-final", "whisper-urdu-r2-final")}
+    assert len(names) == 3, names
+    assert m.eval_results_path() == "/data/logs/eval_results.json", \
+        "the untagged default must stay round 1's filename, so it is never rewritten"
+
+
+# ── regressions for the two bugs found on 2026-08-27 ──────────────────────────
+def test_misaligned_sidecar_is_discarded():
+    """BUG: the predictions sidecar decides whether to attach episode/source labels
+    by comparing LENGTHS. A right-length/wrong-content eval_buckets.json passed that
+    check, so every row got a confident WRONG label -- someone reading what they
+    believed was B3039's output would have been reading another episode's.
+
+    Both rejection branches must reset bmeta to [].
+    """
+    src = MODAL_APP.read_text(encoding="utf-8")
+    tree = ast.parse(src)
+    fn = next(n for n in tree.body
+              if isinstance(n, ast.FunctionDef) and n.name == "evaluate")
+    discards = 0
+    for node in ast.walk(fn):
+        if not isinstance(node, ast.If):
+            continue
+        for branch in (node.body, node.orelse):
+            warns = any(isinstance(s, ast.Expr) and isinstance(s.value, ast.Call)
+                        and getattr(s.value.func, "id", "") == "print" for s in branch)
+            resets = any(isinstance(s, ast.Assign)
+                         and any(getattr(t, "id", "") == "bmeta" for t in s.targets)
+                         and isinstance(s.value, ast.List) and not s.value.elts
+                         for s in branch)
+            if warns and resets:
+                discards += 1
+    assert discards == 2, (
+        f"expected both sidecar-rejection branches to reset bmeta=[], found {discards}")
+
+
+def test_adapter_is_committed_before_the_merge():
+    """BUG: one volume.commit(), after BOTH the adapter save and the 6.2 GB merged
+    save. The adapter is the only irreplaceable output -- the merged model derives
+    from it, nothing regenerates the adapter but another full training run. A failure
+    in merge_and_unload() therefore discarded training that had already succeeded.
+    """
+    lines = code_lines(train_block(MODAL_APP.read_text(encoding="utf-8")))
+    assert lines.count("volume.commit()") == 2, "expected two commits in train()"
+    i_save = next(i for i, l in enumerate(lines)
+                  if l == "model.save_pretrained(out_adapter)")
+    i_commit = next(i for i, l in enumerate(lines)
+                    if l == "volume.commit()" and i > i_save)
+    i_merge = next(i for i, l in enumerate(lines) if "merge_and_unload" in l)
+    assert i_save < i_commit < i_merge, (
+        f"order must be adapter-save -> commit -> merge; got "
+        f"save={i_save} commit={i_commit} merge={i_merge}")
+
+
+def test_resume_load_passes_is_trainable():
+    """Without is_trainable=True the adapter loads FROZEN: training runs to
+    completion, logs a loss curve, saves a model, and changes nothing."""
+    src = MODAL_APP.read_text(encoding="utf-8")
+    m = re.search(r"PeftModel\.from_pretrained\(([^)]*)\)", src)
+    assert m, "PeftModel.from_pretrained call not found"
+    assert "is_trainable=True" in " ".join(m.group(1).split())
+
+
+def test_train_fails_loudly_on_the_silent_no_ops():
+    """Three raises, not warnings: zero trainable params, no lora_B at all, and
+    every lora_B zero (a freshly-initialised adapter, i.e. round 1 never loaded)."""
+    block = train_block(MODAL_APP.read_text(encoding="utf-8"))
+    segment = block[block.index("trainable = sum("):block.index("# ── Data Collator")]
+    assert segment.count("raise RuntimeError") == 3, (
+        f"expected 3 raises guarding the silent no-ops, found "
+        f"{segment.count('raise RuntimeError')}")
+    assert '"lora_B" in n' in segment, "the lora_B non-zero check is missing"
+
+
+# ── plain-python runner (pytest is not installed in either venv) ──────────────
+if __name__ == "__main__":
+    tests = [(n, o) for n, o in sorted(globals().items())
+             if n.startswith("test_") and callable(o)]
+    passed = skipped = 0
+    failures = []
+    for name, fn in tests:
+        try:
+            fn()
+        except Skipped as exc:
+            skipped += 1
+            print(f"  SKIP {name}: {exc}")
+        except AssertionError as exc:
+            failures.append((name, exc))
+            print(f"  FAIL {name}: {exc}")
+        except Exception as exc:  # noqa: BLE001 - report, do not mask
+            failures.append((name, f"{type(exc).__name__}: {exc}"))
+            print(f"  ERROR {name}: {type(exc).__name__}: {exc}")
+        else:
+            passed += 1
+            print(f"  ok   {name}")
+    print(f"\n{passed} passed, {skipped} skipped, {len(failures)} failed "
+          f"({len(tests)} checks)")
+    sys.exit(1 if failures else 0)
