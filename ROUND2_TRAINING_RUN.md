@@ -337,9 +337,14 @@ Set A and Set B go into **ONE combined eval split** (720 clips) in the round-2 d
 | metric_for_best_model | wer | wer (blended) | plus `wer_r1` / `wer_b3` reported, see below |
 | GPU / timeout | A10G / 8 h | **A10G / 12 h** | ~4.4 h train + 3 eval passes + 8.8k-clip feature extraction |
 
-**LR is a judgement call, not a derived number.** The tripwire is Set A's WER at epoch 1: if it
-lands far above 10.50%, the LR is too high and round 2 is overwriting round 1. That is only
-visible if the two eval sources are reported separately — hence `wer_r1` / `wer_b3` below.
+**LR is a judgement call, not a derived number.** The tripwire is Set A's WER at epoch 1: if it lands
+far above round 1's **raw 15.71%** (⚠️ not 10.50% — see the raw/normalized note in "What to read in
+the first minute"), the LR is too high and round 2 is overwriting round 1. That is only visible if the
+two eval sources are reported separately — hence `wer_r1` / `wer_b3` below.
+
+✅ **MEASURED, epoch 1:** `eval_wer_r1` **15.80** raw vs round 1's best 15.71 raw — **+0.09, inside
+round 1's own epoch-to-epoch spread of 0.27** (15.71→15.98→15.90→15.89). Round 1's competence is
+preserved; **5e-6 is vindicated, no intervention needed.**
 
 **Epoch estimate** from round 1's measured throughput (93.3 clip-passes/min on A10G):
 2 ep ≈ 2.9 h, **3 ep ≈ 4.4 h**, 4 ep ≈ 5.9 h — excluding eval passes and preprocessing.
@@ -795,6 +800,40 @@ still written, minus the per-clip labels. `bmeta` is initialised empty specifica
 
 ---
 
+## ✅ FINAL RESULT (2026-08-28) — all four criteria met
+
+Plain-language write-up: <https://claude.ai/code/artifact/a5f4f777-b107-4397-beb0-35a5514c4fa9>
+
+Harness validated before anything was read: round 1 re-scored **10.50%** on Set A — its original
+figure to the decimal — plus `r1/spiritual_term` **9.38%** and bucket counts **194/52/129**, all
+matching round 1's record; base returned **18.57%**. Nothing drifted in the rebuild.
+
+Normalized WER / CER from `modal_app.py::evaluate`:
+
+| subset | n | base | round 1 | **round 2** | ΔWER | ΔCER |
+|---|---|---|---|---|---|---|
+| **Set B** (new corpus) | 474 | 14.47 / 9.94 | 8.19 / 4.19 | **7.47 / 3.47** | −8.8% | **−17.2%** |
+| **Set A** (must not regress) | 246 | 18.57 / 13.91 | 10.50 / 5.44 | **10.30 / 5.06** | −1.9% | −7.0% |
+| **b3/nastaliq_only** ★ crit. 1 | 337 | 13.09 / 7.53 | 8.20 / 3.89 | **7.83 / 3.50** | −4.5% | **−10.0%** |
+| **b3/code_switch** ★ crit. 4 | 137 | 17.55 / 15.24 | 8.16 / 4.86 | **6.65 / 3.42** | **−18.5%** | **−29.6%** |
+| b3/spiritual_term | 121 | 16.40 / 11.54 | 8.65 / 4.47 | **8.15 / 3.83** | −5.8% | −14.3% |
+| r1/code_switch | 52 | 20.46 / 17.49 | 12.70 / 7.70 | **11.24 / 6.18** | −11.5% | −19.7% |
+| r1/nastaliq_only | 194 | 18.05 / 12.91 | 9.89 / 4.80 | **10.04 / 4.74** | +1.5% | −1.3% |
+| r1/spiritual_term | 129 | 20.29 / 16.63 | 9.38 / 4.42 | **9.46 / 4.41** | +0.9% | −0.2% |
+| blended | 720 | 15.85 / 11.30 | 8.97 / 4.62 | **8.42 / 4.02** | −6.1% | −13.0% |
+
+★ **CER improves ~2× more than WER in almost every row** — the direct signature of a corpus edited at
+median character similarity 0.970 (see line 825). WER is binary per word, so a one-letter correction
+scores identically to no correction: **most of what the reviewers taught is invisible to WER.**
+Judging this round on WER alone understates it by roughly half, which is the retrospective
+justification for adding CER.
+
+Honest scale: round 1 cut Set A 18.57 → 10.50 (~43% rel). Round 2 adds ~11–13% **on top of** round 1's
+total gain, with no regression. The two cells that tick up are both <1 point with flat-or-better CER.
+
+Training was still improving at epoch 3 (no overfitting, unlike round 1's epoch-6 peak), so **more
+epochs is the cheapest next test** — ahead of open question 0's encoder work.
+
 ## Success criteria (set BEFORE the run, so the result cannot be rationalised)
 
 ### ★ Stated priority (user, 2026-08-27), and criteria ordered to match it
@@ -953,8 +992,13 @@ failed it, which is how the cancellation was found — so the last scenario is k
 3. `✅ resume confirmed: N/M lora_B tensors carry trained (non-zero) weights`
 4. from **step 25 onward**: `grad_norm` in the logging lines — `0.0` or `nan` means fp16 is skipping
    every step and the run is training nothing. Kill it; don't wait for the end-of-run guard.
-5. at **step 254 (epoch 1)**: `eval_wer_r1` — the forgetting tripwire. Far above 10.50% ⇒ stop,
-   lower the LR, restart. ~$2, not ~$8.
+5. at **step 254 (epoch 1)**: `eval_wer_r1` — the forgetting tripwire.
+   ⚠️ **Compare against 15.71%, NOT 10.50%.** `compute_metrics` reports **RAW** WER; 10.50% is
+   `evaluate()`'s **normalized** figure and on identical outputs raw 15.68% == normalized 10.50%
+   (`FULL_WHISPER_TRAINING_RUN.md:193`). Round 1's RAW curve on Set A ran
+   21.16 / 17.69 / 16.42 / 16.05 / 15.78 / **15.71⭐** / 15.98 / 15.90 / 15.89, base raw 23.87%.
+   Read it as: **~15.7–16.0 = round 1 preserved · >17 = concerning · ~20+ = real forgetting** ⇒ stop,
+   lower the LR, restart (~$2, not ~$8).
 
 At the **end** of the run, two lines confirm the run was real rather than merely complete:
 `✅ adapter committed` then `✅ weights moved: N/M LoRA tensors changed during training`.

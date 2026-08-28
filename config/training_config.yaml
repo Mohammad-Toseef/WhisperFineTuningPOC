@@ -56,8 +56,14 @@ training:
   # trades some speed at learning Batch 3's code-switching for keeping round 1's
   # spiritual_term result (9.38%).
   # This is a judgement call, and it is FALSIFIABLE at epoch 1: watch
-  # `eval_wer_r1` (change #6). If it has climbed well above 10.50%, the rate is
-  # too high — stop, lower it, restart. That costs ~1.5 h, not the run.
+  # `eval_wer_r1` (change #6).
+  # ⚠️ COMPARE IT AGAINST 15.71%, **NOT** 10.50%. compute_metrics reports RAW WER;
+  # the 10.50% headline is evaluate()'s NORMALIZED number, and on identical
+  # outputs raw 15.68% == normalized 10.50%. Round 1's RAW per-epoch curve on
+  # Set A was 21.16/17.69/16.42/16.05/15.78/15.71*/15.98/15.90/15.89 (base raw
+  # 23.87%). So: ~15.7-16.0 = round 1 preserved; >17 = concerning; ~20+ = real
+  # forgetting, stop and lower the rate (~1.5 h, not the run).
+  # MEASURED round 2, epoch 1: eval_wer_r1 = 15.80 raw -> preserved.
   learning_rate: 5.0e-6
 
   # ── Step schedule (step-based; no num_train_epochs) ──

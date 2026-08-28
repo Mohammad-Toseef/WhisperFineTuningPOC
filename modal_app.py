@@ -672,13 +672,31 @@ def evaluate(which: str = "both", dataset_path: str = "", model_path: str = ""):
         print(f"⚠️  CER metric unavailable ({type(exc).__name__}: {exc}) — WER only. "
               "Spelling quality will be much harder to read.")
 
-    # WER text normalizer — applied EQUALLY to base & fine-tuned so the
-    # comparison is fair. Strips punctuation (Urdu + Latin) and collapses
-    # whitespace; keeps diacritics (they are part of the target labels).
+    # WER text normalizers — applied EQUALLY to base & fine-tuned so the
+    # comparison is fair. TWO of them, reported side by side:
+    #
+    #   normalize()  punctuation only. What round 1's published 10.50% and the
+    #                model card were measured with. KEPT so historical figures
+    #                stay comparable — redefining it in place would silently make
+    #                every future number incomparable to the published ones while
+    #                looking identical.
+    #   bare()       punctuation + harakat. These transcripts are for subtitles
+    #                and search, where vowel marks carry nothing for a reader —
+    #                but the reviewer's اُحد against the model's احد differs by a
+    #                single invisible U+064F and scored as a WHOLE substituted
+    #                word. Measured on the 720-clip set that inflated round 2's
+    #                Set B WER by 1.80 points, ~24% of its remaining word errors.
+    #
+    # `scripts/rescore.py` applies either to already-saved predictions, so this
+    # never has to be re-run on a GPU to change the reporting basis.
     _punct = r"[۔،؛؟!?.,:;\"'“”‘’()\-—…]"
+    _diacritic = r"[ً-ْٰـ]"   # harakat, superscript alef, tatweel — NOT hamza
     def normalize(text: str) -> str:
         text = re.sub(_punct, " ", text)
         return re.sub(r"\s+", " ", text).strip()
+
+    def bare(text: str) -> str:
+        return re.sub(r"\s+", " ", re.sub(_diacritic, "", re.sub(_punct, " ", text))).strip()
 
     # `path`, not `model_path`: the outer scope now has a `model_path` argument
     # and shadowing it here would make the two impossible to tell apart.
@@ -715,21 +733,29 @@ def evaluate(which: str = "both", dataset_path: str = "", model_path: str = ""):
 
         npreds = [normalize(p) for p in preds]
         nrefs = [normalize(r) for r in references]
+        bpreds = [bare(p) for p in preds]
+        brefs = [bare(r) for r in references]
         raw_wer = 100 * wer_metric.compute(predictions=preds, references=references)
         norm_wer = 100 * wer_metric.compute(predictions=npreds, references=nrefs)
-        raw_cer = norm_cer = None
+        bare_wer = 100 * wer_metric.compute(predictions=bpreds, references=brefs)
+        raw_cer = norm_cer = bare_cer = None
         if cer_metric is not None:
             raw_cer = 100 * cer_metric.compute(predictions=preds, references=references)
             norm_cer = 100 * cer_metric.compute(predictions=npreds, references=nrefs)
+            bare_cer = 100 * cer_metric.compute(predictions=bpreds, references=brefs)
 
-        # Normalized WER + CER over an arbitrary index subset.
+        # Normalized WER + CER over an arbitrary index subset, both bases.
         def subset_scores(idxs: list[int]) -> dict:
             p = [npreds[i] for i in idxs]
             r = [nrefs[i] for i in idxs]
+            bp = [bpreds[i] for i in idxs]
+            br = [brefs[i] for i in idxs]
             out = {"n": len(idxs),
-                   "norm_wer": 100 * wer_metric.compute(predictions=p, references=r)}
+                   "norm_wer": 100 * wer_metric.compute(predictions=p, references=r),
+                   "bare_wer": 100 * wer_metric.compute(predictions=bp, references=br)}
             if cer_metric is not None:
                 out["norm_cer"] = 100 * cer_metric.compute(predictions=p, references=r)
+                out["bare_cer"] = 100 * cer_metric.compute(predictions=bp, references=br)
             return out
 
         buckets_wer = {b: subset_scores(i) for b, i in bucket_indices.items() if i}
@@ -739,10 +765,12 @@ def evaluate(which: str = "both", dataset_path: str = "", model_path: str = ""):
         del model
         torch.cuda.empty_cache()
         cer_txt = f" | norm CER {norm_cer:.2f}%" if norm_cer is not None else ""
+        bare_txt = f" | bare CER {bare_cer:.2f}%" if bare_cer is not None else ""
         print(f"   → {label}: raw WER {raw_wer:.2f}% | normalized WER {norm_wer:.2f}%{cer_txt}")
+        print(f"      no-diacritics (subtitles/search): WER {bare_wer:.2f}%{bare_txt}")
         return {"label": label, "model_path": path,
-                "raw_wer": raw_wer, "norm_wer": norm_wer,
-                "raw_cer": raw_cer, "norm_cer": norm_cer,
+                "raw_wer": raw_wer, "norm_wer": norm_wer, "bare_wer": bare_wer,
+                "raw_cer": raw_cer, "norm_cer": norm_cer, "bare_cer": bare_cer,
                 "buckets": buckets_wer, "sources": sources_wer,
                 "source_buckets": source_buckets_wer, "predictions": preds}
 
