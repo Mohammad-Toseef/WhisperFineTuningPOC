@@ -85,11 +85,21 @@ SCRIPT_VARIANT = [
 TRUE_HOMOPHONE = [
     "سصث",        # /s/  — کثرت / کسرت
     "زذضظ",       # /z/
-    "تط",         # /t/  — ٹ EXCLUDED: retroflex is a different sound
+    "تط",         # /t/  — تائب / طائب. ٹ EXCLUDED: retroflex is a different sound
     "حہ",         # /h/  — applied AFTER the script fold, so ه is already ہ.
                   #        ھ EXCLUDED: it marks aspiration (کھ != ک)
     "نں",         # noon vs noon-ghunna
 ]
+
+# عا and آ are both long /aa/ — عاجزی / آجزی and عام / آم are homophone pairs, so
+# choosing between them is spelling, not hearing. Added after a reviewer who reads
+# Urdu supplied عاجزی -> آجزی, which was scoring as an unexplained near-miss.
+#
+# Deliberately NOT a blanket ع -> ا. That merged علم (ilm) with الم (alam) —
+# different words with different vowels — and the regression check caught it. Only
+# ع IMMEDIATELY BEFORE alef is folded; a bare ع keeps its identity.
+# Applied after the script fold, so آ has already become ا.
+_AIN_ALEF = re.compile(r"عا")
 # Deliberately left out — enable if you disagree:
 #   "قک"  ق and ک merge to /k/ for many speakers, but they are distinct letters
 #         and merging them would hide a real substitution class.
@@ -137,7 +147,8 @@ def ortho_key(word: str) -> str:
     Two words that share this key but not script_key were pronounced identically
     and spelled differently — a genuine spelling error.
     """
-    return "".join(_HOMO_FOLD.get(c, c) for c in script_key(word))
+    folded = _AIN_ALEF.sub("ا", script_key(word))
+    return "".join(_HOMO_FOLD.get(c, c) for c in folded)
 
 
 def classify(ref: str, hyp: str, near_miss: float) -> str:
