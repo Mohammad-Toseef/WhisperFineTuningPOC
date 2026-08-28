@@ -43,3 +43,8 @@ full_audio_samples/compare_transcripts/*
 !config/episode_skip_start_v2.xlsx
 !Whisper_Second_Round_Training_list.xlsx
 Manifest_Analysis_Report.docx
+
+# Generated review output. reports/*.html embed FULL transcript text (reference
+# and model output, per clip), so they are corpus data, not code — same reason
+# data/ is ignored. Regenerate with scripts/triage_errors.py --html.
+reports/
