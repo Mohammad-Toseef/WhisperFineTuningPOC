@@ -74,5 +74,39 @@ them apart.
 |---|---|
 | launch | `✅ 57,671,680 trainable (3.60%)` · `resume confirmed: 320/512` — 320 is correct, round 1's encoder `lora_B` is still zero |
 | launch | `two LR groups — decoder 640 @ 5.0e-06 \| encoder 384 @ 1.0e-05` |
+| step 254 | epoch 1 eval — see below |
 
-_Filled in as epochs land._
+### Epoch 1 (step 254) — no forgetting, ahead of round 2
+
+In-training **RAW** metrics from `compute_metrics`. Not comparable to the
+normalized figures in the table above; compare only against round 2's in-training
+numbers, and Set A against round 1's raw curve.
+
+| | r2 @ ep1 | **r3 @ ep1** | Δ |
+|---|---|---|---|
+| blended WER | 12.271 | **12.081** | −0.19 |
+| blended CER | 5.129 | **4.977** | −0.15 |
+| Set B WER | 10.469 | **10.252** | −0.22 |
+| Set B CER | 4.472 | **4.213** | −0.26 |
+| **Set A WER** | 15.799 | **15.664** | −0.14 |
+| Set A CER | 6.401 | 6.458 | **+0.06** |
+| eval_loss | 0.1978 | **0.1923** | −0.006 |
+
+★ **The forgetting risk did not materialise.** Set A WER **15.664** is below round
+1's own best of **15.71** and below round 2's 15.799 at the same point — despite
+41% more of the model moving at twice the decoder's rate. That was the obvious way
+this round could go wrong.
+
+⚠️ Set A **CER** is the single metric that worsened (+0.06, +0.9% rel). Small;
+watch it at epochs 2 and 3 rather than reading it now.
+
+Round 3 at epoch 1 reaches what round 2 reached at **epoch 2** on blended WER.
+Suggestive, not conclusive — the round's actual hypothesis is about the
+mis-hearing category, which only the post-run triage can answer.
+
+**Not a bug:** round 3's blended WER (12.0810098658006) is identical to 13 decimal
+places to round 2's *epoch 2*. WER is an integer error count over a fixed word
+count, and the two subsets moved in opposite directions relative to that run —
+Set B better, Set A worse — summing to the same total. Every other metric differs.
+
+**Eval cost is up:** 1,926 s vs round 2's 1,875 s per pass, so ~32 min each.

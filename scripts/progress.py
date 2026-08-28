@@ -58,9 +58,31 @@ METRIC = re.compile(r"\{'eval_loss'.*?\}")
 LOSS = re.compile(r"\{'loss':\s*([\d.]+).*?'epoch':\s*([\d.]+)\}")
 WER = re.compile(r"'eval_wer_r1':\s*([\d.]+)")
 
-EVAL_MINUTES = 31.3      # measured: 720 clips with predict_with_generate
+EVAL_MINUTES = 32.1      # measured: 720 clips with predict_with_generate
 N_EVALS = 3
 REFRESH_SECONDS = 60
+TRAIN_TOTAL = None
+
+
+def training_total() -> int | None:
+    """max_steps from the local config — used to tell the TRAINING tqdm bar apart
+    from the EVAL one.
+
+    Both emit the same `N/M [elapsed<remaining, X s/it]` shape, and the eval bar
+    counts batches (180 of them at eval batch size 4). Taking the last match in
+    the log therefore showed 180/180 = 100% the moment an eval pass started, while
+    training was only a third done. Filtering on the known training total is what
+    keeps the bar honest.
+    """
+    try:
+        import yaml
+        from pathlib import Path
+        cfg = yaml.safe_load(
+            (Path(__file__).resolve().parents[1] / "config" / "training_config.yaml")
+            .read_text(encoding="utf-8"))
+        return int(cfg["training"]["max_steps"])
+    except Exception:      # noqa: BLE001 - run from elsewhere, or no pyyaml
+        return None
 
 
 # ── data ────────────────────────────────────────────────────────────────────
@@ -86,21 +108,69 @@ def fetch(app_id: str) -> str:
     return out
 
 
+def _secs(clock: str) -> int:
+    """'1:46:32' or '46:23' -> seconds."""
+    parts = [int(x) for x in clock.split(":")]
+    while len(parts) < 3:
+        parts.insert(0, 0)
+    return parts[0] * 3600 + parts[1] * 60 + parts[2]
+
+
+def recent_rate(steps: list) -> "float | None":
+    """Seconds per step from RECENT progress, not tqdm's running average.
+
+    tqdm reports elapsed/steps over the whole run, so once a ~32 minute eval pass
+    has happened its s/it is badly inflated — 27.9 s/step when the true rate is
+    ~17 — and every remaining-time estimate built on it is wrong by hours.
+
+    Taking the MEDIAN of consecutive-pair rates fixes it: an eval stall is one
+    outlier pair among many and the median ignores it, without needing to know
+    where the stall was.
+    """
+    rates = []
+    for (c1, _t1, e1, _r1, _s1), (c2, _t2, e2, _r2, _s2) in zip(steps, steps[1:]):
+        d_step, d_time = int(c2) - int(c1), _secs(e2) - _secs(e1)
+        if d_step > 0 and d_time > 0:
+            rates.append(d_time / d_step)
+    if not rates:
+        return None
+    rates = sorted(rates[-60:])
+    return rates[len(rates) // 2]
+
+
 def hms(seconds: float) -> str:
     seconds = int(max(0, seconds))
     h, m = divmod(seconds // 60, 60)
     return f"{h}h {m:02d}m" if h else f"{m}m"
 
 
-def parse(log: str) -> dict:
+def parse(log: str, train_total: "int | None" = None) -> dict:
     """One shape of status, shared by the window and the console renderer."""
+    # Only the completion line means finished. `cur >= total` does NOT: at 762/762
+    # the run still has an eval pass, the adapter save, the moved-weights check
+    # and a 6.2 GB merge ahead of it.
     finished = "Training complete" in log
-    info = {"finished": finished, "started": False, "pct": 100.0 if finished else 0.0}
+    info = {"finished": finished, "started": False, "pct": 100.0 if finished else 0.0,
+            "evaluating": False}
 
-    steps = STEP.findall(log)
+    all_matches = STEP.findall(log)
+    totals = [int(m[1]) for m in all_matches]
+    if train_total is None and totals:
+        # No config to read: the training bar is the one with the largest total
+        # (762 training steps vs 180 eval batches).
+        train_total = max(totals)
+
+    steps = [m for m in all_matches if int(m[1]) == train_total]
+    # An eval pass is running if the most recent bar in the log is NOT the
+    # training one. During those ~32 minutes the training bar simply stops moving.
+    info["evaluating"] = bool(all_matches) and int(all_matches[-1][1]) != train_total
+
     if steps:
         cur, total, elapsed, _remaining, sec_it = steps[-1]
-        cur, total, sec_it = int(cur), int(total), float(sec_it)
+        cur, total = int(cur), int(total)
+        # Prefer the recent median over tqdm's run-long average, which an eval
+        # pass inflates by 60%+.
+        sec_it = recent_rate(steps) or float(sec_it)
         evals_done = len(METRIC.findall(log))
         train_left = (total - cur) * sec_it
         evals_left = max(0, N_EVALS - evals_done)
@@ -110,8 +180,11 @@ def parse(log: str) -> dict:
             evals_done=evals_done, evals_left=evals_left,
             train_left=train_left,
             eta=train_left + evals_left * EVAL_MINUTES * 60,
-            finished=finished or cur >= total,
+            finished=finished,
         )
+        if info["evaluating"]:
+            e_cur, e_total = int(all_matches[-1][0]), int(all_matches[-1][1])
+            info["eval_progress"] = (e_cur, e_total)
     loss = LOSS.findall(log)
     if loss:
         info["loss"], info["epoch"] = loss[-1][0], float(loss[-1][1])
@@ -141,6 +214,10 @@ def render_console(info: dict) -> bool:
     print(f"  evals done {info['evals_done']}/{N_EVALS}"
           f"   ·   training left {hms(info['train_left'])}"
           f"   ·   ETA {hms(info['eta'])}")
+    if info.get("eval_progress"):
+        e_cur, e_total = info["eval_progress"]
+        print(f"  ⏸  EVALUATING now — batch {e_cur}/{e_total}. Training is paused; "
+              "the bar above is correct, not stuck.")
     if "loss" in info:
         print(f"  latest loss {info['loss']}   ·   epoch {info['epoch']:.2f}")
     if "wer_r1" in info:
@@ -168,7 +245,7 @@ def run_gui(app_id: str, every: int) -> int:
         network call or the window freezes for seconds at every refresh."""
         while not stop.is_set():
             try:
-                results.put(parse(fetch(app_id)))
+                results.put(parse(fetch(app_id), TRAIN_TOTAL))
             except Exception as exc:  # noqa: BLE001 - surface it in the window
                 results.put({"error": str(exc), "started": False,
                              "finished": False, "pct": 0.0})
@@ -239,6 +316,9 @@ def run_gui(app_id: str, every: int) -> int:
         if "wer_r1" in info:
             lines.append(f"Set A WER {info['wer_r1']:.2f} raw   "
                          f"(round 1 = 15.71, >17 concerning)")
+        if info.get("eval_progress"):
+            e_cur, e_total = info["eval_progress"]
+            lines.append(f"EVALUATING batch {e_cur}/{e_total} — training paused")
         if info.get("stage"):
             lines.append(f"stage     {info['stage']}")
         body.config(text="\n".join(lines))
@@ -269,7 +349,7 @@ def run_console(app_id: str, every: int, watch: bool) -> int:
     while True:
         print(f"\n  {time.strftime('%H:%M:%S')}  {app_id}")
         try:
-            live = render_console(parse(fetch(app_id)))
+            live = render_console(parse(fetch(app_id), TRAIN_TOTAL))
         except RuntimeError as exc:
             sys.exit(str(exc))
         if not watch or not live:
@@ -288,6 +368,9 @@ def main() -> int:
     ap.add_argument("--every", type=int, default=REFRESH_SECONDS,
                     help=f"seconds between refreshes (default {REFRESH_SECONDS})")
     args = ap.parse_args()
+
+    global TRAIN_TOTAL
+    TRAIN_TOTAL = training_total()
 
     if args.console:
         return run_console(args.app_id, args.every, args.watch)
