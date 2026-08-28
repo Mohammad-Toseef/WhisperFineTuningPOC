@@ -67,6 +67,51 @@ def eval_predictions_path(run_tag: str = "", label: str = "") -> str:
 
 # Round-1 (untagged) locations. Still the defaults for evaluate/transcribe, and
 # the resume source for round 2.
+def is_encoder_param(name: str) -> bool:
+    """True for encoder parameters, false for decoder ones.
+
+    `encoder_attn` lives in the DECODER — it is the decoder's cross-attention —
+    and its parameter names contain ".encoder_attn.", not ".encoder.", so this
+    predicate correctly leaves it on the decoder side. Verified by the probe:
+    384 encoder / 640 decoder LoRA tensors, matching 192x2 and 320x2 modules.
+    """
+    return ".encoder." in name and ".decoder." not in name
+
+
+def build_dual_rate_optimizer(model, t_cfg: dict, training_args):
+    """AdamW with the encoder on its own, higher learning rate.
+
+    The two halves are in opposite states. The decoder has trained on this domain
+    twice and needs protecting; the encoder has never been updated at all (its
+    lora_B is still zero) and needs to actually move. One rate serves one of them
+    badly — at the decoder's 5e-6 a cold encoder may barely shift in 3 epochs, and
+    the run would read as "the encoder does not help" when it only under-trained.
+
+    Shared by train() and probe() on purpose: the probe is what verifies this
+    construction against the real model before a multi-hour run depends on it.
+    """
+    import torch
+
+    enc = [p for n, p in model.named_parameters()
+           if p.requires_grad and is_encoder_param(n)]
+    dec = [p for n, p in model.named_parameters()
+           if p.requires_grad and not is_encoder_param(n)]
+    enc_lr = t_cfg["encoder_learning_rate"]
+    dec_lr = t_cfg["learning_rate"]
+    print(f"⚙️  two LR groups — decoder {len(dec)} tensors @ {dec_lr:.1e}"
+          f" | encoder {len(enc)} tensors @ {enc_lr:.1e}")
+    if not enc:
+        print("⚠️  NO encoder parameters are trainable — the second group is empty, "
+              "so this run is decoder-only regardless of the encoder rate.")
+    return torch.optim.AdamW(
+        [{"params": dec, "lr": dec_lr}, {"params": enc, "lr": enc_lr}],
+        lr=dec_lr,
+        weight_decay=training_args.weight_decay,
+        betas=(training_args.adam_beta1, training_args.adam_beta2),
+        eps=training_args.adam_epsilon,
+    )
+
+
 ADAPTER_PATH = adapter_path()
 FINAL_MODEL_PATH = final_model_path()
 
@@ -429,6 +474,12 @@ def train():
         warmup_steps=t_cfg["warmup_steps"],
         max_steps=t_cfg["max_steps"],
         gradient_checkpointing=t_cfg["gradient_checkpointing"],
+        # use_reentrant=False is what lets the ENCODER train at all — the
+        # reentrant path gates graph construction on the checkpointed block's
+        # INPUTS, and Whisper's encoder input is a gradient-free mel spectrogram.
+        # See the long note in training_config.yaml.
+        gradient_checkpointing_kwargs={
+            "use_reentrant": t_cfg["gradient_checkpointing_use_reentrant"]},
         fp16=t_cfg["fp16"],
         evaluation_strategy=t_cfg["evaluation_strategy"],
         eval_steps=t_cfg["eval_steps"],
@@ -449,6 +500,8 @@ def train():
         decoder_start_token_id=model.config.decoder_start_token_id,
     )
 
+    optimizer = build_dual_rate_optimizer(model, t_cfg, training_args)
+
     trainer = Seq2SeqTrainer(
         args=training_args,
         model=model,
@@ -457,6 +510,10 @@ def train():
         data_collator=data_collator,
         compute_metrics=compute_metrics,
         tokenizer=processor.feature_extractor,
+        # Scheduler left to the Trainer: passing None for it means warmup and
+        # linear decay are built over THIS optimizer, scaling both groups
+        # proportionally rather than flattening them to one rate.
+        optimizers=(optimizer, None),
     )
 
     # ── Weight signature, for the one silent no-op left ────────────
@@ -534,6 +591,192 @@ def train():
     volume.commit()
 
     print(f"✅ Training complete. Model saved to {out_final}")
+
+
+# ── Probe: does the encoder actually train, and does it fit? ─────────
+@app.function(
+    image=image,
+    gpu="A10G",
+    timeout=60 * 30,
+    volumes={VOLUME_PATH: volume},
+    memory=32768,
+)
+def probe(steps: int = 3):
+    """A few real training steps, then answer three questions and exit.
+
+        1. Do the ENCODER's LoRA weights receive gradients?  <- round 3's premise
+        2. Does it fit in 24 GB at the configured batch size?
+        3. How long is a step, so the run can be costed?
+
+    Deliberately separate from train() rather than a flag on it. It writes
+    NOTHING: output_dir is /tmp, save_strategy is "no", and neither
+    save_pretrained nor volume.commit() is ever called — so a probe cannot damage
+    an artifact no matter how it is invoked. The duplication is the price of that
+    guarantee, and the thing being de-risked costs ~$10 a run.
+
+    Question 1 is the valuable one. use_reentrant=False was verified locally on a
+    toy module of the same graph shape; this verifies it on real Whisper, where
+    the encoder is 32 checkpointed layers behind a frozen conv stack.
+
+        modal run modal_app.py::probe
+        modal run modal_app.py::probe --steps 5
+    """
+    import os
+    import time
+    import yaml
+    import torch
+    from dataclasses import dataclass
+    from typing import Any, Dict, List, Union
+    from datasets import load_from_disk, Audio
+    from transformers import (
+        WhisperProcessor, WhisperForConditionalGeneration,
+        Seq2SeqTrainingArguments, Seq2SeqTrainer,
+    )
+    from peft import LoraConfig, PeftModel, get_peft_model
+
+    with open(f"{VOLUME_PATH}/config/training_config.yaml") as f:
+        cfg = yaml.safe_load(f)
+    t_cfg, l_cfg = cfg["training"], cfg["lora"]
+    eff = t_cfg["per_device_train_batch_size"] * t_cfg["gradient_accumulation_steps"]
+
+    print("🔬 PROBE — no artifact is written")
+    print(f"   batch {t_cfg['per_device_train_batch_size']} x "
+          f"accum {t_cfg['gradient_accumulation_steps']} = effective {eff}")
+    print(f"   gradient_checkpointing={t_cfg['gradient_checkpointing']} "
+          f"use_reentrant={t_cfg['gradient_checkpointing_use_reentrant']}")
+    print(f"   resume <- {l_cfg.get('resume_from_adapter') or '(fresh adapter)'}")
+
+    processor = WhisperProcessor.from_pretrained(
+        cfg["model"]["name"], language=cfg["model"]["language"],
+        task=cfg["model"]["task"])
+    model = WhisperForConditionalGeneration.from_pretrained(cfg["model"]["name"])
+    model.config.forced_decoder_ids = None
+    model.config.suppress_tokens = []
+    model.config.use_cache = False
+
+    resume_from = l_cfg.get("resume_from_adapter")
+    if resume_from:
+        model = PeftModel.from_pretrained(model, resume_from, is_trainable=True)
+    else:
+        model = get_peft_model(model, LoraConfig(
+            r=l_cfg["r"], lora_alpha=l_cfg["lora_alpha"],
+            target_modules=l_cfg["target_modules"],
+            lora_dropout=l_cfg["lora_dropout"], task_type=l_cfg.get("task_type")))
+    model.enable_input_require_grads()
+
+    def half(name: str) -> str:
+        return "encoder" if ".encoder." in name and ".decoder." not in name else "decoder"
+
+    watched = {n: p for n, p in model.named_parameters()
+               if p.requires_grad and "lora_" in n}
+    before = {n: p.detach().double().pow(2).sum().item() for n, p in watched.items()}
+    print(f"   watching {len(watched)} trainable LoRA tensors "
+          f"({sum(1 for n in watched if half(n) == 'encoder')} encoder / "
+          f"{sum(1 for n in watched if half(n) == 'decoder')} decoder)")
+
+    ds = load_from_disk(cfg["data"]["dataset_path"])
+    ds = ds.cast_column("audio", Audio(sampling_rate=16000))
+    n_needed = min(len(ds["train"]), steps * eff)
+    small = ds["train"].select(range(n_needed))
+
+    def prepare(batch):
+        a = batch["audio"]
+        batch["input_features"] = processor.feature_extractor(
+            a["array"], sampling_rate=a["sampling_rate"]).input_features[0]
+        batch["labels"] = processor.tokenizer(batch["sentence"]).input_ids
+        return batch
+
+    small = small.map(prepare, remove_columns=small.column_names, num_proc=2)
+
+    @dataclass
+    class Collator:
+        processor: Any
+        decoder_start_token_id: int
+
+        def __call__(self, features: List[Dict[str, Union[List[int], torch.Tensor]]]):
+            batch = self.processor.feature_extractor.pad(
+                [{"input_features": f["input_features"]} for f in features],
+                return_tensors="pt")
+            labels_batch = self.processor.tokenizer.pad(
+                [{"input_ids": f["labels"]} for f in features], return_tensors="pt")
+            labels = labels_batch["input_ids"].masked_fill(
+                labels_batch.attention_mask.ne(1), -100)
+            if (labels[:, 0] == self.decoder_start_token_id).all().cpu().item():
+                labels = labels[:, 1:]
+            batch["labels"] = labels
+            return batch
+
+    args = Seq2SeqTrainingArguments(
+        output_dir="/tmp/probe",                    # NOT the volume
+        per_device_train_batch_size=t_cfg["per_device_train_batch_size"],
+        gradient_accumulation_steps=t_cfg["gradient_accumulation_steps"],
+        learning_rate=t_cfg["learning_rate"],
+        warmup_steps=0,
+        max_steps=steps,
+        gradient_checkpointing=t_cfg["gradient_checkpointing"],
+        gradient_checkpointing_kwargs={
+            "use_reentrant": t_cfg["gradient_checkpointing_use_reentrant"]},
+        fp16=t_cfg["fp16"],
+        evaluation_strategy="no",
+        save_strategy="no",                         # writes nothing
+        logging_steps=1,
+        report_to="none",
+    )
+    # The SAME optimizer construction train() uses, so this probe verifies the
+    # parameter split and the dual rates on the real model rather than a stand-in.
+    trainer = Seq2SeqTrainer(
+        args=args, model=model, train_dataset=small,
+        data_collator=Collator(processor=processor,
+                               decoder_start_token_id=model.config.decoder_start_token_id),
+        tokenizer=processor.feature_extractor,
+        optimizers=(build_dual_rate_optimizer(model, t_cfg, args), None),
+    )
+
+    torch.cuda.reset_peak_memory_stats()
+    t0 = time.time()
+    trainer.train()
+    elapsed = time.time() - t0
+
+    # ── 1. did the ENCODER actually train? ─────────────────────────
+    # MOVEMENT, not `p.grad is not None`. The Trainer calls zero_grad(set_to_none)
+    # after every optimizer step, so once train() returns every .grad is None for
+    # BOTH halves — the first version of this probe checked that and raised
+    # "the encoder received no gradients" on a run where all 384 encoder tensors
+    # had in fact moved. Movement is also the stronger claim: a parameter cannot
+    # move unless the optimizer applied a real gradient to it.
+    total = {"encoder": 0, "decoder": 0}
+    moved = {"encoder": 0, "decoder": 0}
+    for n, p in watched.items():
+        total[half(n)] += 1
+        if p.detach().double().pow(2).sum().item() != before[n]:
+            moved[half(n)] += 1
+
+    total_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
+    peak_gb = torch.cuda.max_memory_allocated() / 1e9
+
+    print("\n" + "=" * 62)
+    print("PROBE RESULTS")
+    print("=" * 62)
+    for k in ("encoder", "decoder"):
+        flag = "" if moved[k] == total[k] else "   ⚠️"
+        print(f"  {k:<8} {moved[k]:>4}/{total[k]} LoRA tensors moved{flag}")
+    print(f"  peak VRAM {peak_gb:.1f} GB of {total_gb:.1f} GB "
+          f"({100 * peak_gb / total_gb:.0f}%)")
+    print(f"  {elapsed / steps:.1f} s/step over {steps} steps "
+          f"(includes warm-up, so the real run is faster)")
+
+    if moved["encoder"] == 0:
+        raise RuntimeError(
+            "THE ENCODER DID NOT MOVE. use_reentrant=False did not take effect — "
+            "round 3 would repeat round 2 exactly. Do not launch.")
+    if moved["encoder"] < total["encoder"]:
+        print(f"\n  ⚠️  only {moved['encoder']}/{total['encoder']} encoder tensors "
+              "moved — partial, investigate before committing to a full run")
+    est_h = (t_cfg["max_steps"] * elapsed / steps) / 3600
+    print(f"\n  ✅ encoder IS training ({moved['encoder']}/{total['encoder']}). "
+          f"Full run ≈ {est_h:.1f} h of training passes + 3 evals (~31 min each)")
+    return {"encoder_moved": moved["encoder"], "encoder_total": total["encoder"],
+            "peak_gb": peak_gb, "sec_per_step": elapsed / steps}
 
 
 # ── Evaluation (baseline vs fine-tuned WER) ──────────────────────────
