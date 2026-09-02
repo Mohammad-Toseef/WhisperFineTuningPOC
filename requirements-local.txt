@@ -1,0 +1,63 @@
+# Local environment for THIS repo — one venv, at ./venv
+#
+#     ./venv/Scripts/python.exe -m pip install -r requirements-local.txt
+#
+# WHY THIS FILE EXISTS, SEPARATELY FROM requirements.txt
+# ------------------------------------------------------
+# requirements.txt lists everything the PROJECT needs, including the packages
+# that only ever execute inside a Modal container: torch on a GPU, transformers,
+# peft, whisperx, faster-whisper, ctranslate2. Those are installed by the
+# `modal.Image.pip_install([...])` blocks in modal_app.py / modal_align.py and
+# are never imported on this machine — installing them locally costs gigabytes
+# and buys nothing.
+#
+# This file is the LOCAL subset: what the scripts that actually run here import.
+# Verified by reading every local entry point's module-level imports rather than
+# by guessing (`src/`, `scripts/`, `run_batch_pipeline.py`, `modal_*.py`).
+#
+# The split that made this necessary: work was spread over TWO environments,
+# neither complete —
+#
+#     SRTTimeStampPOC/.venv   had torch, transformers, safetensors, current yt-dlp
+#     WhisperFineTuningPOC/venv  had datasets, librosa, soundfile, stale yt-dlp
+#
+# so `python` (the first) could not run the dataset builder and `./venv` could not
+# run inspect_adapter.py. Modal access was NOT the reason for the split: the
+# credentials live in ~/.modal.toml, machine-wide, so any env with the `modal`
+# package authenticates identically.
+#
+# ⚠️ A venv cannot be relocated by copying — pyvenv.cfg and every Scripts/*.exe
+# shim embed absolute paths. Recreate and reinstall instead.
+
+# ── Batch pipeline: sheet -> audio -> chunks ─────────────────────────────
+pandas>=2.0.0            # src/srt_pipeline/validate_sheet.py
+openpyxl>=3.1.0          # .xlsx backend for pandas
+yt-dlp>=2026.8.19        # src/srt_pipeline/download_batch.py
+                         # PIN THE FLOOR: 2026.7.4 fails with HTTP 403 on
+                         # YouTube's JS challenge. Bump this when it breaks
+                         # again — it is an arms race, not a stable API.
+soundfile>=0.12.1        # audio read/write in the chunking stages
+librosa>=0.10.1          # resampling / duration probing
+
+# ── Dataset build (scripts/, src/) ───────────────────────────────────────
+datasets>=2.18.0,<3.0.0  # >=3.0 requires torchcodec for Audio decoding
+huggingface_hub>=0.23    # scripts/push_to_hub.py, model downloads
+
+# ── Adapter inspection: scripts/inspect_adapter.py ───────────────────────
+safetensors>=0.4         # reads adapter_model.safetensors
+torch>=2.2.0             # safe_open(framework="pt") + the dW = B@A maths.
+                         # INSTALL THE CPU WHEEL — ~250 MB vs ~2.5 GB, and
+                         # every local use is CPU-only:
+                         #   pip install torch --index-url \
+                         #     https://download.pytorch.org/whl/cpu
+
+# ── Orchestration and reporting ──────────────────────────────────────────
+modal>=0.62.0            # launches remote work; auth from ~/.modal.toml
+pyyaml>=6.0              # config/training_config.yaml readers
+numpy>=1.24
+
+# tkinter (scripts/progress.py) ships with CPython on Windows — not installable
+# via pip. progress.py falls back to --console if it is unavailable.
+#
+# ffmpeg / ffprobe are EXTERNAL binaries, needed by the trim and chunk stages
+# and by yt-dlp's audio extraction. Not pip-installable; must be on PATH.

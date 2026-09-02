@@ -91,10 +91,62 @@ def parse_skip_start(value) -> tuple[float | None, str | None, str | None]:
     return number, None, None
 
 
+def _clock_from_excel_type(value, field: str):
+    """Excel-re-typed clock cell -> (seconds, repair_label, error), or None.
+
+    BRANCH ON TYPE, NOT ON TEXT. A `datetime.time`/`timedelta` cell is proof that
+    Excel re-typed what the human wrote, and what they wrote was MM:SS — the same
+    misparse `parse_skip_start` already repairs. A *string* cell was never
+    re-typed, so 'MM:SS' and 'H:MM:SS' there mean exactly what they say and must
+    keep their existing reading (Batch 3 depends on it).
+
+    Getting here via str() is what made this dangerous rather than merely broken:
+    `time(19, 26)` stringifies to '19:26:00', which the generic three-component
+    path read as H:MM:SS = 69,960s instead of 1,166s. Sixty times too large, with
+    no error and no repair label — and `skip < speech_end` still passes, so
+    nothing downstream noticed. Batch 3 never hit it because its clock cells were
+    strings and its `.hour` never exceeded 1; Batch 4's run to 19, and past 24
+    hours Excel switches storage to `timedelta`, which crashed instead.
+
+    `.second == 0` is what separates the two readings, and it is the same
+    invariant the skip_start repair was verified against: a human typing two
+    components (MM:SS) leaves seconds at zero once Excel shifts it to H:MM. A
+    non-zero seconds field means three components were typed, so the value is a
+    genuine H:MM:SS clock — labelled distinctly rather than silently assumed.
+    """
+    if isinstance(value, dt.time):
+        h, m, s = value.hour, value.minute, value.second
+    elif isinstance(value, dt.timedelta):
+        t = int(value.total_seconds())
+        h, m, s = t // 3600, (t % 3600) // 60, t % 60
+    else:
+        return None
+
+    shown = f"{h}:{m:02d}" if not s else f"{h}:{m:02d}:{s:02d}"
+    if s:
+        seconds = float(h * 3600 + m * 60 + s)
+        return seconds, (f"{field}: read as literal H:MM:SS ({shown} -> "
+                         f"{seconds:.0f}s); seconds field is non-zero"), None
+    seconds = float(h * 60 + m)
+    return seconds, (f"{field}: Excel MM:SS misparse ({shown} -> "
+                     f"{seconds:.0f}s)"), None
+
+
 def parse_clock(value, field: str) -> tuple[float | None, str | None, str | None]:
-    """'H:MM:SS' / 'MM:SS' / 'MM.SS' -> (seconds, repair_label, error)."""
+    """'H:MM:SS' / 'MM:SS' / 'MM.SS' -> (seconds, repair_label, error).
+
+    Also accepts the `datetime.time` / `datetime.timedelta` cells Excel produces
+    when it re-types a hand-typed MM:SS — see `_clock_from_excel_type`.
+    """
     if pd.isna(value):
         return None, None, f"{field} is empty"
+
+    # Must run BEFORE str(): stringifying these loses the type that tells us the
+    # value was re-typed, and the result parses as a plausible wrong number.
+    typed = _clock_from_excel_type(value, field)
+    if typed is not None:
+        return typed
+
     raw = str(value).strip()
     text, repair = raw, None
 
