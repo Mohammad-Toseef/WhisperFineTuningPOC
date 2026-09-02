@@ -264,6 +264,43 @@ def drop_repetition_cues(cues: list, chant_units: set[str]) -> tuple[list, list[
     """
     found = [find_repetition(text, chant_units) for _, _, text in cues]
 
+    # Seed pass for runs that NO single cue can reveal. find_repetition needs
+    # MIN_REPEATS (4) consecutive copies of the unit, so a 5-word unit needs 20
+    # words before it trips -- but a VAD cue here holds ~12. A loop spread evenly
+    # across cues therefore shows 2-3 repeats each, every cue passes, and the
+    # outward-absorption pass below never starts because it has nothing to walk
+    # out from.
+    #
+    # Measured: B4002 looped 'اُن کے کپڑے دھلوا دینا،' across 10 cues for 24s.
+    # Per cue, repeats=0 and nothing was excluded; once grouped into one chunk the
+    # same detector returned repeats=12, share=1.0. The QA gate then failed the
+    # episode on the manifest -- correctly, but a stage too late to act on, since
+    # stage 5 skips videos already in the manifest.
+    #
+    # So test short windows of ADJACENT cues too: two cues is already 24 words,
+    # enough for a 5-word unit to reach threshold. Only cues that are themselves
+    # built from the run's words are seeded (is_continuation), which preserves the
+    # cue-granularity principle above -- a window holding one clean cue plus
+    # repeats must not cost the clean one.
+    for size in (2, 3):
+        for index in range(len(cues) - size + 1):
+            span = range(index, index + size)
+            if any(found[i] is not None for i in span):
+                continue
+            joined = " ".join(cues[i][2] for i in span)
+            windowed = find_repetition(joined, chant_units)
+            if windowed is None:
+                continue
+            for i in span:
+                text = cues[i][2]
+                if not is_continuation(text, windowed.unit):
+                    continue
+                words = len(text.split())
+                found[i] = Repetition(
+                    windowed.unit, windowed.unit_tokens, repeats=0,
+                    covered=words, total=words, kind=windowed.kind,
+                    origin=f"window{size}")
+
     # Second pass: a long chant spans many cues, and the ones at each end carry only 2-3
     # repeats or a truncated fragment. Judged alone they pass, then reach training as the
     # looping text we are removing. Walk outward from every detected run and absorb
