@@ -329,6 +329,41 @@ def run_stages(args, log: RunLog | None) -> int:
     if unknown:
         sys.exit(f"unknown stage(s) {unknown}; valid: {', '.join(ALL_STAGES)}")
 
+    # Stage 3+4 must be TOLD which model to pre-transcribe with. Omitting it used
+    # to fall through to modal_align.py's own default, `whisper-urdu-final` --
+    # which is ROUND 1's model and has been two rounds stale since. Nothing failed;
+    # the batch simply came back transcribed by a weaker model, and the only trace
+    # was one line in a detached GPU log. Reviewers then correct output that is
+    # needlessly worse (round 1 scores 6.49/3.24 on Set B where round 3 scores
+    # 5.19/2.30), and that cost is spread over every hour of audio in the batch.
+    #
+    # A default cannot fix this: whatever it points at goes stale the next round,
+    # which is exactly how it broke. So require the choice, and make it auditable
+    # in the run log rather than implicit.
+    if "34" in stages and not args.model_path:
+        sys.exit(
+            "stage 3+4 needs --model-path: which fine-tuned model should "
+            "pre-transcribe this batch?\n"
+            "  Newest first (paths are on the Modal volume):\n"
+            "    /data/model/whisper-urdu-r3-final   round 3, decoder+encoder  "
+            "Set B 5.19/2.30  <- current best\n"
+            "    /data/model/whisper-urdu-r2-final   round 2, decoder only     "
+            "Set B 5.67/2.52\n"
+            "    /data/model/whisper-urdu-final      round 1, decoder only     "
+            "Set B 6.49/3.24\n"
+            "  Pass --stages 0,1,2 to run the non-GPU stages without deciding yet.")
+
+    # Git Bash rewrites any argument that looks like a POSIX path, so
+    # `--model-path /data/model/...` arrives as
+    # `C:/Program Files/Git/data/model/...`. The model then does not exist on the
+    # volume and a detached GPU stage is what discovers it. Cheap to catch here.
+    if args.model_path and not args.model_path.startswith("/data/"):
+        hint = ("\n  Git Bash rewrote the path — re-run with MSYS_NO_PATHCONV=1, "
+                "or use PowerShell."
+                if "Program Files" in args.model_path or ":" in args.model_path else "")
+        sys.exit(f"--model-path must be a path on the Modal volume, starting "
+                 f"with /data/ — got {args.model_path!r}{hint}")
+
     # Stage 0 must happen before anything can be selected, since selection reads the CSV.
     if "0" in stages and (not paths.validated_csv.exists() or args.revalidate):
         print(f"\n{'=' * 78}\nSTAGE 0 — {STAGE_NAMES['0']}\n{'=' * 78}")
@@ -436,7 +471,13 @@ def main() -> None:
     run_parser.add_argument("--revalidate", action="store_true", help="Re-run stage 0 even if the CSV exists")
     run_parser.add_argument("--sheet", help="Override the sheet name passed to stage 0")
     run_parser.add_argument("--xlsx", help="Override the spreadsheet passed to stage 0")
-    run_parser.add_argument("--model-path", help="Fine-tuned model for stage 3+4 (default: the volume's whisper-urdu-final)")
+    run_parser.add_argument("--model-path",
+                            help="REQUIRED for stage 3+4: which fine-tuned model "
+                                 "pre-transcribes this batch, e.g. "
+                                 "/data/model/whisper-urdu-r3-final. There is no "
+                                 "default on purpose — any default goes stale the "
+                                 "next round, and the wrong one costs reviewer time "
+                                 "silently.")
     run_parser.add_argument("--windows", choices=["chunks", "vad"], default="vad",
                             help="How stage 3+4 draws segment windows: 'vad' = cut at detected "
                                  "silence (default), 'chunks' = the old fixed 28s grid. See modal_align.py.")
