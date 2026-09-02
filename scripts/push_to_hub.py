@@ -63,7 +63,15 @@ def _tag(run_tag: str) -> str:
     timeout=60 * 60 * 2,
 )
 def push(run_tag: str = "", what: str = "adapter", private: bool = True,
-         repo: str = ""):
+         repo: str = "", card: str = ""):
+    """card  path ON THE VOLUME to a model card, uploaded as the repo's root
+    README.md — the Hub's front page.
+
+    Without it, `--what adapter` uploads everything into a subfolder and the repo
+    front page stays empty, so the page a colleague opens says nothing about what
+    the model is or how it scored. The adapter folder's own README is PEFT's
+    auto-generated stub, and it lands in the subfolder rather than at root.
+    """
     import os
     from pathlib import Path
     from huggingface_hub import HfApi
@@ -100,6 +108,13 @@ def push(run_tag: str = "", what: str = "adapter", private: bool = True,
         targets.append((Path(f"{VOLUME_PATH}/model/whisper-urdu{tag}-final"),
                         f"{run_tag}-merged" if run_tag else "",
                         "merged model"))
+
+    card_path = Path(card) if card else None
+    if card_path and not card_path.is_file():
+        raise FileNotFoundError(
+            f"model card not found on volume: {card_path}\n"
+            "  Put it there first:  modal volume put whisper-training-vol "
+            "<local.md> model/<name>.md")
 
     # Check EVERYTHING before creating the repo, so a typo'd tag does not leave an
     # empty repo behind on the Hub.
@@ -151,6 +166,17 @@ def push(run_tag: str = "", what: str = "adapter", private: bool = True,
         )
         print(f"   ✅ {label} uploaded")
 
+    if card_path:
+        print(f"\n   model card: {card_path.name} -> README.md (repo root)")
+        api.upload_file(
+            path_or_fileobj=str(card_path),
+            path_in_repo="README.md",
+            repo_id=repo_id,
+            repo_type="model",
+            commit_message="Add model card",
+        )
+        print("   ✅ model card uploaded")
+
     print(f"\n✅ https://huggingface.co/{repo_id} (private={private})")
 
 
@@ -186,8 +212,11 @@ def whoami():
 
 @app.local_entrypoint()
 def main(run_tag: str = "", what: str = "adapter", private: bool = True,
-         repo: str = "", who: bool = False):
+         repo: str = "", who: bool = False, card: str = ""):
+    # Every option must be declared HERE as well as on push(): the CLI is built
+    # from this entrypoint's signature, so a parameter added only to push() is
+    # rejected as "No such option".
     if who:
         whoami.remote()
         return
-    push.remote(run_tag, what, private, repo)
+    push.remote(run_tag, what, private, repo, card)

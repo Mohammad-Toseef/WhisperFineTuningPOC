@@ -34,6 +34,7 @@ def download_playlist_audio(playlist_url: str, output_dir: str, audio_format: st
     if not entries:
         entries = [playlist_info]
 
+    failed: list = []
     for entry in entries:
         video_id = entry["id"]
         title = entry.get("title", video_id)
@@ -58,6 +59,25 @@ def download_playlist_audio(playlist_url: str, output_dir: str, audio_format: st
         print(f"Downloading: {filename}  ({title})")
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.download([video_url])
+
+        # ignoreerrors=True is deliberate — one dead video should not abort a
+        # 50-video playlist — but it also means ydl.download() returns quietly
+        # after a 403, and the caller then printed "✅ Saved to ...". Check that
+        # the file is actually on disk, or the failure is invisible until
+        # something downstream cannot find the audio.
+        if not (output_path / f"{filename}.{audio_format}").exists():
+            failed.append((video_id, title))
+            print(f"  ❌ FAILED: {filename} produced no {audio_format} file")
+
+    if failed:
+        print(f"\n❌ {len(failed)} of {len(entries)} download(s) failed:")
+        for vid, title in failed:
+            print(f"     {vid}  {title}")
+        if len(failed) == len(entries):
+            raise RuntimeError(
+                f"No audio was downloaded ({len(failed)}/{len(entries)} failed). "
+                "A 403 here usually means yt-dlp is behind YouTube's player "
+                "changes — try: python -m pip install -U yt-dlp")
 
 
 def main() -> None:

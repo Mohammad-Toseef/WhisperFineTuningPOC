@@ -23,13 +23,16 @@ final numbers are still readable. Fetching happens on a worker thread — a
 the window every refresh.
 """
 import argparse
+import json
 import os
 import queue
 import re
 import subprocess
 import sys
+import tempfile
 import threading
 import time
+from pathlib import Path
 
 if hasattr(sys.stdout, "reconfigure"):
     try:
@@ -61,6 +64,7 @@ WER = re.compile(r"'eval_wer_r1':\s*([\d.]+)")
 EVAL_MINUTES = 32.1      # measured: 720 clips with predict_with_generate
 N_EVALS = 3
 REFRESH_SECONDS = 60
+TAIL_ENTRIES = 3000      # must span a whole eval pass; see fetch()
 TRAIN_TOTAL = None
 
 
@@ -86,10 +90,15 @@ def training_total() -> int | None:
 
 
 # ── data ────────────────────────────────────────────────────────────────────
-def fetch(app_id: str) -> str:
+def fetch(app_id: str, tail: int = TAIL_ENTRIES) -> str:
+    """`modal app logs` defaults to the last 100 ENTRIES, and tqdm redraws are one
+    entry each. A ~32 minute eval pass emits well over 100 of them, so the default
+    window can contain nothing but eval bars — no training step, no metrics line.
+    Ask for enough history to reach back past the longest expected stall."""
     env = dict(os.environ, PYTHONIOENCODING="utf-8", PYTHONUTF8="1")
     try:
-        p = subprocess.run(["modal", "app", "logs", app_id], capture_output=True,
+        p = subprocess.run(["modal", "app", "logs", app_id, "--tail", str(tail)],
+                           capture_output=True,
                            text=True, encoding="utf-8", errors="replace", env=env,
                            timeout=180)
     except FileNotFoundError:
@@ -106,6 +115,29 @@ def fetch(app_id: str) -> str:
         raise RuntimeError(f"Modal does not recognise app id {app_id!r}:\n"
                            f"{out.strip()[:300]}")
     return out
+
+
+def cache_path(app_id: str) -> Path:
+    """Outside the repo on purpose — this is scratch state, not project data."""
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", app_id)
+    return Path(tempfile.gettempdir()) / f"whisper_progress_{safe}.json"
+
+
+def load_cache(app_id: str) -> dict:
+    try:
+        return json.loads(cache_path(app_id).read_text(encoding="utf-8"))
+    except Exception:      # noqa: BLE001 - absent, truncated, or unreadable
+        return {}
+
+
+def save_cache(app_id: str, info: dict) -> None:
+    keep = ("cur", "total", "sec_it", "elapsed", "evals_done", "loss", "epoch",
+            "wer_r1", "stage")
+    try:
+        cache_path(app_id).write_text(
+            json.dumps({k: info[k] for k in keep if k in info}), encoding="utf-8")
+    except Exception:      # noqa: BLE001 - a read-only temp dir is not fatal
+        pass
 
 
 def _secs(clock: str) -> int:
@@ -144,21 +176,32 @@ def hms(seconds: float) -> str:
     return f"{h}h {m:02d}m" if h else f"{m}m"
 
 
-def parse(log: str, train_total: "int | None" = None) -> dict:
-    """One shape of status, shared by the window and the console renderer."""
+def parse(log: str, train_total: "int | None" = None, cache: "dict | None" = None) -> dict:
+    """One shape of status, shared by the window and the console renderer.
+
+    `cache` carries values forward from earlier refreshes. This is not an
+    optimisation — it is required for correctness. `modal app logs` returns a
+    ROLLING TAIL of a few kilobytes, so during a ~32 minute eval pass the window
+    holds nothing but eval bars: no training step, no metrics line, no loss. Read
+    in isolation that looks identical to a run that has not started, which is
+    exactly what the window reported. Whatever the log no longer mentions is taken
+    from the last refresh that did mention it.
+    """
+    cache = cache or {}
     # Only the completion line means finished. `cur >= total` does NOT: at 762/762
     # the run still has an eval pass, the adapter save, the moved-weights check
     # and a 6.2 GB merge ahead of it.
     finished = "Training complete" in log
     info = {"finished": finished, "started": False, "pct": 100.0 if finished else 0.0,
-            "evaluating": False}
+            "evaluating": False, "stale": False}
 
     all_matches = STEP.findall(log)
     totals = [int(m[1]) for m in all_matches]
-    if train_total is None and totals:
+    if train_total is None:
         # No config to read: the training bar is the one with the largest total
-        # (762 training steps vs 180 eval batches).
-        train_total = max(totals)
+        # (762 training steps vs 180 eval batches). The cached total outranks a
+        # guess from the window, which during an eval sees only 180.
+        train_total = cache.get("total") or (max(totals) if totals else None)
 
     steps = [m for m in all_matches if int(m[1]) == train_total]
     # An eval pass is running if the most recent bar in the log is NOT the
@@ -169,34 +212,62 @@ def parse(log: str, train_total: "int | None" = None) -> dict:
         cur, total, elapsed, _remaining, sec_it = steps[-1]
         cur, total = int(cur), int(total)
         # Prefer the recent median over tqdm's run-long average, which an eval
-        # pass inflates by 60%+.
-        sec_it = recent_rate(steps) or float(sec_it)
-        evals_done = len(METRIC.findall(log))
+        # pass inflates by 60%+. A short window may hold too few pairs to take a
+        # median from, so the cached rate is the next best thing.
+        sec_it = recent_rate(steps) or cache.get("sec_it") or float(sec_it)
+    elif "cur" in cache:
+        # Mid-eval, or the window has simply moved past the training bar.
+        cur, total = int(cache["cur"]), int(cache.get("total") or train_total or 0)
+        elapsed, sec_it = cache.get("elapsed", "?"), cache.get("sec_it") or 0.0
+        info["stale"] = True
+    else:
+        cur = None
+
+    if cur is not None and total:
+        # Never let a stale window walk the bar backwards.
+        if cur < int(cache.get("cur", 0)):
+            cur, elapsed = int(cache["cur"]), cache.get("elapsed", elapsed)
+            info["stale"] = True
+        evals_done = max(len(METRIC.findall(log)), int(cache.get("evals_done", 0)))
         train_left = (total - cur) * sec_it
         evals_left = max(0, N_EVALS - evals_done)
+        eta = train_left + evals_left * EVAL_MINUTES * 60
         info.update(
             started=True, cur=cur, total=total, sec_it=sec_it, elapsed=elapsed,
             pct=100.0 if finished else 100 * cur / total,
-            evals_done=evals_done, evals_left=evals_left,
-            train_left=train_left,
-            eta=train_left + evals_left * EVAL_MINUTES * 60,
-            finished=finished,
+            evals_done=evals_done, evals_left=evals_left, train_left=train_left,
+            eta=eta, finished=finished,
         )
         if info["evaluating"]:
             e_cur, e_total = int(all_matches[-1][0]), int(all_matches[-1][1])
+            e_rate = float(all_matches[-1][4])
             info["eval_progress"] = (e_cur, e_total)
+            info["eval_left"] = (e_total - e_cur) * e_rate
+            # The pass now running has not emitted its metrics line yet, so it is
+            # still inside evals_left at full price. Charge what is actually left
+            # of it instead.
+            if evals_left:
+                info["eta"] = (train_left + (evals_left - 1) * EVAL_MINUTES * 60
+                               + info["eval_left"])
+
     loss = LOSS.findall(log)
     if loss:
         info["loss"], info["epoch"] = loss[-1][0], float(loss[-1][1])
+    elif "loss" in cache:
+        info["loss"], info["epoch"] = cache["loss"], cache.get("epoch", 0.0)
     evals = METRIC.findall(log)
     if evals:
         info["last_eval"] = evals[-1]
     wer = WER.findall(log)
     if wer:
         info["wer_r1"] = float(wer[-1])
+    elif "wer_r1" in cache:
+        info["wer_r1"] = cache["wer_r1"]
     for marker in ("weights moved", "adapter committed", "Merging adapter"):
         if marker in log:
             info.setdefault("stage", marker)
+    if "stage" not in info and cache.get("stage"):
+        info["stage"] = cache["stage"]
     return info
 
 
@@ -216,8 +287,9 @@ def render_console(info: dict) -> bool:
           f"   ·   ETA {hms(info['eta'])}")
     if info.get("eval_progress"):
         e_cur, e_total = info["eval_progress"]
-        print(f"  ⏸  EVALUATING now — batch {e_cur}/{e_total}. Training is paused; "
-              "the bar above is correct, not stuck.")
+        print(f"  [pause] EVALUATING — batch {e_cur}/{e_total}, "
+              f"~{hms(info.get('eval_left', 0))} left. Training is paused, so the "
+              "step above is correct, not stuck.")
     if "loss" in info:
         print(f"  latest loss {info['loss']}   ·   epoch {info['epoch']:.2f}")
     if "wer_r1" in info:
@@ -245,7 +317,9 @@ def run_gui(app_id: str, every: int) -> int:
         network call or the window freezes for seconds at every refresh."""
         while not stop.is_set():
             try:
-                results.put(parse(fetch(app_id), TRAIN_TOTAL))
+                info = parse(fetch(app_id), TRAIN_TOTAL, load_cache(app_id))
+                save_cache(app_id, info)
+                results.put(info)
             except Exception as exc:  # noqa: BLE001 - surface it in the window
                 results.put({"error": str(exc), "started": False,
                              "finished": False, "pct": 0.0})
@@ -318,7 +392,9 @@ def run_gui(app_id: str, every: int) -> int:
                          f"(round 1 = 15.71, >17 concerning)")
         if info.get("eval_progress"):
             e_cur, e_total = info["eval_progress"]
-            lines.append(f"EVALUATING batch {e_cur}/{e_total} — training paused")
+            lines.append(f"EVALUATING batch {e_cur}/{e_total}"
+                         f"  ~{hms(info.get('eval_left', 0))} left"
+                         "  — training paused, step is not stuck")
         if info.get("stage"):
             lines.append(f"stage     {info['stage']}")
         body.config(text="\n".join(lines))
@@ -349,7 +425,9 @@ def run_console(app_id: str, every: int, watch: bool) -> int:
     while True:
         print(f"\n  {time.strftime('%H:%M:%S')}  {app_id}")
         try:
-            live = render_console(parse(fetch(app_id), TRAIN_TOTAL))
+            info = parse(fetch(app_id), TRAIN_TOTAL, load_cache(app_id))
+            save_cache(app_id, info)
+            live = render_console(info)
         except RuntimeError as exc:
             sys.exit(str(exc))
         if not watch or not live:

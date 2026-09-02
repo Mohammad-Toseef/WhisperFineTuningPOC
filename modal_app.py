@@ -1022,12 +1022,24 @@ def evaluate(which: str = "both", dataset_path: str = "", model_path: str = ""):
         results["base"] = run_model(base_name, f"BASE ({base_name})")
     if which in ("finetuned", "both"):
         if not os.path.exists(ft_path):
-            # Loud, and it names the path: the likeliest cause is a run_tag'd
-            # model being looked for at round 1's default location.
-            print(f"⚠️  Fine-tuned model not found at {ft_path} — pass --model-path, "
-                  "or run train first.")
-        else:
-            results["finetuned"] = run_model(ft_path, f"FINE-TUNED ({os.path.basename(ft_path)})")
+            # RAISE, do not warn-and-continue. Warning here used to fall through
+            # to the report, which then printed empty tables and SAVED a results
+            # file plus a predictions sidecar named after the model that was never
+            # loaded — e.g. eval_results-r3-whisper-urdu-final.json holding
+            # nothing, indistinguishable by name from a real control run. An
+            # absent artifact is recoverable; a plausible empty one is a trap.
+            #
+            # The path is echoed because it is usually mangled rather than
+            # missing: a POSIX /data/... argument passed from Git Bash arrives as
+            # C:/Program Files/Git/data/..., which is what happened here. Run
+            # these from PowerShell, or set MSYS_NO_PATHCONV=1.
+            raise FileNotFoundError(
+                f"Fine-tuned model not found at {ft_path!r}.\n"
+                "   If that path looks like it grew a C:/Program Files/Git prefix, "
+                "Git Bash rewrote it —\n"
+                "   re-run from PowerShell or with MSYS_NO_PATHCONV=1.\n"
+                "   Otherwise pass --model-path, or run train first.")
+        results["finetuned"] = run_model(ft_path, f"FINE-TUNED ({os.path.basename(ft_path)})")
 
     # ── Report ─────────────────────────────────────────────────────
     print("\n" + "=" * 60)
