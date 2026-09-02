@@ -1,6 +1,10 @@
 # Round 3 — train the encoder
 
-**Status:** 🟡 training, launched 2026-08-28 · Modal app `ap-ymw97lY4HQZmytWLTMU5ex`
+**Status:** ✅ complete — trained 2026-08-28 (Modal app `ap-ymw97lY4HQZmytWLTMU5ex`,
+`weights moved: 1024/1024`), evaluated, triaged, and **published** to
+[`mohammad-toseef059/whisper-large-v3-urdu-r3`](https://huggingface.co/mohammad-toseef059/whisper-large-v3-urdu-r3)
+(private). See [`RESULTS.md`](RESULTS.md) for the scorecard and
+[`MODEL_CARD.md`](MODEL_CARD.md) for the Hub card.
 
 Everything about this round lives in this folder. Rounds 1 and 2 are documented in
 `FULL_WHISPER_TRAINING_RUN.md` and `ROUND2_TRAINING_RUN.md` at the repo root.
