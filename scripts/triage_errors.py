@@ -56,7 +56,11 @@ FILES = {
     "base": "eval_predictions-r2-base.json",
     "r1": "eval_predictions-r2-whisper-urdu-final.json",
     "r2": "eval_predictions-r2-whisper-urdu-r2-final.json",
+    "r3": "eval_predictions-r3-whisper-urdu-r3-final.json",
 }
+# The newest model: the one whose remaining errors are being triaged, and the one
+# samples are drawn from. The column before it is the control it is judged against.
+LATEST, CONTROL = "r3", "r2"
 
 # ── Letters that SOUND THE SAME in Urdu but are written differently ──────────
 # Collapsing these turns "wrote the wrong letter for the right sound" into an
@@ -266,13 +270,14 @@ def write_html(path: Path, scope: str, counts: dict, totals: dict,
                samples: dict, near_miss: float) -> None:
     rows = []
     for cat in CATEGORIES:
-        b, r1, r2 = counts["base"][cat], counts["r1"][cat], counts["r2"][cat]
-        d = f"{100 * (r2 - r1) / r1:+.1f}%" if r1 else "—"
-        cls = "up" if r1 and r2 > r1 else ("down" if r1 and r2 < r1 else "")
+        b, r1 = counts["base"][cat], counts["r1"][cat]
+        ctl, new = counts[CONTROL][cat], counts[LATEST][cat]
+        d = f"{100 * (new - ctl) / ctl:+.1f}%" if ctl else "—"
+        cls = "up" if ctl and new > ctl else ("down" if ctl and new < ctl else "")
         fg, bg = CAT_COLOR[cat]
         rows.append(
             f'<tr><th><span class="chip" style="color:{fg};background:{bg}">{cat}</span></th>'
-            f"<td>{b}</td><td>{r1}</td><td><b>{r2}</b></td>"
+            f"<td>{b}</td><td>{r1}</td><td>{ctl}</td><td><b>{new}</b></td>"
             f'<td class="{cls}">{d}</td><td class="why">{html.escape(BLAME[cat])}</td></tr>')
 
     blocks = []
@@ -330,11 +335,13 @@ def write_html(path: Path, scope: str, counts: dict, totals: dict,
  .m {{ padding: 1px 4px; border-radius: 3px; }}
 </style></head><body>
 <h1>Error triage{html.escape(scope)}</h1>
-<p class="sub">Round 2 vs round 1 vs base, same {totals['clips']} clips.
-Coloured words are where the model differs from the reviewer.
-The console cannot render Urdu — read it here.</p>
+<p class="sub">Round 3 vs round 2 vs round 1 vs base, same {totals['clips']} clips.
+Samples below are <b>round 3's</b> remaining errors. The delta column is
+round&nbsp;2&rarr;round&nbsp;3, the control comparison: both resumed round 1, so it
+isolates the encoder. Coloured words are where the model differs from the
+reviewer. The console cannot render Urdu — read it here.</p>
 <table><thead><tr><th>category</th><th>base</th><th>round 1</th><th>round 2</th>
-<th>r1&rarr;r2</th><th class="why">points at</th></tr></thead>
+<th>round 3</th><th>r2&rarr;r3</th><th class="why">points at</th></tr></thead>
 <tbody>{''.join(rows)}</tbody></table>
 {''.join(blocks)}
 </body></html>""", encoding="utf-8")
@@ -419,7 +426,7 @@ def main() -> int:
             row = rows[i]
             for cat, rw, hw in diff_clip(row["reference"], row[key], args.near_miss):
                 counts[m][cat] += 1
-                if m == "r2":
+                if m == LATEST:
                     pool[cat].append((row.get("episode", "?"), rw, hw,
                                       row["reference"], row[key]))
     samples = {}
@@ -431,37 +438,50 @@ def main() -> int:
         samples[cat] = items[::step][:args.samples]
 
     print()
-    print(f"  {'category':<15}{'base':>9}{'round 1':>10}{'round 2':>10}"
-          f"{'r1→r2':>10}   what it points at")
-    print("  " + "-" * 108)
+    print(f"  {'category':<15}{'base':>9}{'round 1':>10}{'round 2':>10}{'round 3':>10}"
+          f"{'r2→r3':>10}   what it points at")
+    print("  " + "-" * 118)
     for cat in CATEGORIES:
-        b, r1, r2 = counts["base"][cat], counts["r1"][cat], counts["r2"][cat]
-        delta = f"{100 * (r2 - r1) / r1:+.1f}%" if r1 else "—"
+        b, r1 = counts["base"][cat], counts["r1"][cat]
+        ctl, new = counts[CONTROL][cat], counts[LATEST][cat]
+        # The delta that matters is against the CONTROL, not against round 1.
+        # Round 2 and round 3 both resumed round 1, so r2→r3 isolates the encoder.
+        delta = f"{100 * (new - ctl) / ctl:+.1f}%" if ctl else "—"
         note = "  [NOT SCORED] " if cat in UNSCORED else "   "
-        print(f"  {cat:<15}{b:>9}{r1:>10}{r2:>10}{delta:>10}{note}{BLAME[cat]}")
+        print(f"  {cat:<15}{b:>9}{r1:>10}{ctl:>10}{new:>10}{delta:>10}{note}{BLAME[cat]}")
     tot = {m: sum(counts[m][c] for c in SCORED) for m in counts}
-    d = f"{100 * (tot['r2'] - tot['r1']) / tot['r1']:+.1f}%" if tot["r1"] else "—"
-    print("  " + "-" * 108)
-    print(f"  {'TOTAL':<15}{tot['base']:>9}{tot['r1']:>10}{tot['r2']:>10}{d:>10}")
+    d = (f"{100 * (tot[LATEST] - tot[CONTROL]) / tot[CONTROL]:+.1f}%"
+         if tot[CONTROL] else "—")
+    print("  " + "-" * 118)
+    print(f"  {'TOTAL':<15}{tot['base']:>9}{tot['r1']:>10}{tot[CONTROL]:>10}"
+          f"{tot[LATEST]:>10}{d:>10}")
 
-    # The decision number: of what round 2 still gets wrong, how much is the
-    # encoder's fault (misheard + dropped) vs the decoder's (orthographic)?
-    enc = counts["r2"]["misheard"] + counts["r2"]["dropped"]
-    dec = counts["r2"]["spelling"]
-    amb = counts["r2"]["near_miss"] + counts["r2"]["inserted"]
-    conv = counts["r2"]["script_variant"]
-    if tot["r2"]:
+    # The decision number: of what the newest model still gets wrong, how much is
+    # the encoder's fault (misheard + dropped) vs the decoder's (orthographic)?
+    enc = counts[LATEST]["misheard"] + counts[LATEST]["dropped"]
+    dec = counts[LATEST]["spelling"]
+    amb = counts[LATEST]["near_miss"] + counts[LATEST]["inserted"]
+    conv = counts[LATEST]["script_variant"]
+    if tot[LATEST]:
         print()
-        print("  REMAINING SCORED ERRORS IN ROUND 2, by what would actually fix them")
-        print(f"    convention (Arabic/Urdu){conv:>6}  {100*conv/tot['r2']:>5.1f}%"
+        print(f"  REMAINING SCORED ERRORS IN {LATEST.upper()}, "
+              "by what would actually fix them")
+        print(f"    convention (Arabic/Urdu){conv:>6}  {100*conv/tot[LATEST]:>5.1f}%"
               "   ← a DATA decision, not a model fault")
-        print(f"    decoder (real spelling) {dec:>6}  {100*dec/tot['r2']:>5.1f}%"
+        print(f"    decoder (real spelling) {dec:>6}  {100*dec/tot[LATEST]:>5.1f}%"
               "   ← more decoder training")
-        print(f"    encoder (mis-hearing)   {enc:>6}  {100*enc/tot['r2']:>5.1f}%"
+        print(f"    encoder (mis-hearing)   {enc:>6}  {100*enc/tot[LATEST]:>5.1f}%"
               "   ← encoder training")
-        print(f"    ambiguous               {amb:>6}  {100*amb/tot['r2']:>5.1f}%")
-        print(f"    ({counts['r2']['diacritic']} diacritic-only differences excluded "
+        print(f"    ambiguous               {amb:>6}  {100*amb/tot[LATEST]:>5.1f}%")
+        print(f"    ({counts[LATEST]['diacritic']} diacritic-only differences excluded "
               "— no longer scored)")
+        # This round's hypothesis, stated as a number rather than a direction.
+        enc_ctl = counts[CONTROL]["misheard"] + counts[CONTROL]["dropped"]
+        if enc_ctl:
+            print()
+            print(f"  ★ MIS-HEARING: {enc_ctl} in {CONTROL} → {enc} in {LATEST}"
+                  f"  ({100 * (enc - enc_ctl) / enc_ctl:+.1f}%)"
+                  "   ← the question this round exists to answer")
 
     if args.html:
         args.html.parent.mkdir(parents=True, exist_ok=True)
@@ -474,7 +494,7 @@ def main() -> int:
 
     print()
     print("=" * 78)
-    print("SAMPLES from round 2 — check these by eye; the counts are only a first cut")
+    print(f"SAMPLES from {LATEST} — check these by eye; the counts are only a first cut")
     print("=" * 78)
     print("⚠️  A Windows console cannot render Urdu correctly. Use --html for a")
     print("    readable report, or pipe this to a file and open it in an editor.")
