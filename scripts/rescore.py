@@ -39,10 +39,14 @@ _PUNCT = re.compile(r"[۔،؛؟!?.,:;\"'“”‘’()\-—…]")
 # Harakat, superscript alef, tatweel. NOT hamza or the letters themselves.
 _DIACRITIC = re.compile(r"[ً-ْٰـ]")
 
+# The r2-tagged files are round 2's eval RUN, which scored three models over the
+# same clips — base, round 1 and round 2. Round 3's own run adds a fourth. The tag
+# names the run that produced the file, not the model inside it.
 MODELS = {
     "base": ("eval_predictions-r2-base.json", "base"),
     "round 1": ("eval_predictions-r2-whisper-urdu-final.json", "finetuned"),
     "round 2": ("eval_predictions-r2-whisper-urdu-r2-final.json", "finetuned"),
+    "round 3": ("eval_predictions-r3-whisper-urdu-r3-final.json", "finetuned"),
 }
 BUCKETS = ["nastaliq_only", "code_switch", "spiritual_term"]
 SOURCES = {"primary": "Set B (new batch)", "eval_only": "Set A (round 1)"}

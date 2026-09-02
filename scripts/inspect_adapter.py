@@ -135,6 +135,63 @@ def summarise(tensors: dict, label: str) -> int:
     return n_dead
 
 
+def pair_modules(tensors: dict) -> dict:
+    """{module prefix: (A, B)} for every module that has both halves."""
+    pairs = defaultdict(dict)
+    for k, v in tensors.items():
+        if ".lora_A" in k:
+            pairs[k.split(".lora_A")[0]]["A"] = v
+        elif ".lora_B" in k:
+            pairs[k.split(".lora_B")[0]]["B"] = v
+    return {k: (v["A"], v["B"]) for k, v in pairs.items() if "A" in v and "B" in v}
+
+
+def delta_rms(tensors: dict, scaling: float = 1.0) -> dict:
+    """Per-module RMS of the effective weight change, grouped by half.
+
+    `changed vs identical` is binary and cannot answer the question this script is
+    usually run to answer: did a half move ENOUGH, or was its learning rate too
+    low? A tensor that shifts in the twelfth decimal counts as "changed".
+
+    What a LoRA module actually applies to the frozen base weight is
+    `ΔW = (alpha/r) · B @ A`. Its RMS — Frobenius norm over sqrt(numel) — is
+    comparable across modules of different shapes, so encoder and decoder can be
+    put side by side. An encoder two orders of magnitude below the decoder is
+    under-trained, whatever the `changed` count says.
+    """
+    out = defaultdict(list)
+    for name, (A, B) in pair_modules(tensors).items():
+        dw = (B.double() @ A.double()) * scaling
+        out[half_of(name)].append(dw.pow(2).mean().sqrt().item())
+    return dict(out)
+
+
+def report_magnitudes(tensors: dict, label: str, scaling: float = 1.0) -> None:
+    rms = delta_rms(tensors, scaling)
+    if not rms:
+        return
+    print(f"\n  effective update magnitude  ΔW = (alpha/r)·B@A   [{label}]")
+    print(f"  {'half':<10}{'modules':>8}{'median RMS':>14}{'max RMS':>14}")
+    print(f"  {'-' * 46}")
+    for h in ("encoder", "decoder", "other"):
+        if rms.get(h):
+            v = sorted(rms[h])
+            print(f"  {h:<10}{len(v):>8}{v[len(v) // 2]:>14.3e}{v[-1]:>14.3e}")
+    enc, dec = rms.get("encoder"), rms.get("decoder")
+    if enc and dec:
+        e = sorted(enc)[len(enc) // 2]
+        d = sorted(dec)[len(dec) // 2]
+        if e == 0:
+            print("\n  ⚠️  encoder ΔW is exactly zero — the encoder never trained.")
+        else:
+            ratio = e / d
+            verdict = ("comparable — the encoder trained at a real magnitude"
+                       if ratio >= 0.1 else
+                       "⚠️  encoder is >10x weaker — suspect UNDER-TRAINING, not "
+                       "'the encoder does not help'")
+            print(f"\n  encoder / decoder median ΔW = {ratio:.2f}x — {verdict}")
+
+
 def compare(a: dict, b: dict, label_a: str, label_b: str) -> None:
     print(f"\n{'=' * 74}\nCOMPARE  {label_a}  ->  {label_b}\n{'=' * 74}")
     shared = sorted(set(a) & set(b))
@@ -175,6 +232,7 @@ def main():
                    help="second adapter to diff against (e.g. round 1 vs round 2)")
     args = p.parse_args()
 
+    scaling = 1.0
     cfg = args.adapter / "adapter_config.json"
     if cfg.exists():
         c = json.loads(cfg.read_text(encoding="utf-8"))
@@ -182,12 +240,16 @@ def main():
               f"targets={sorted(c.get('target_modules') or [])}")
         print(f"        inference_mode={c.get('inference_mode')} "
               "(true means a resume MUST pass is_trainable=True)")
+        if c.get("r"):
+            scaling = c.get("lora_alpha", c["r"]) / c["r"]
 
     first = load(args.adapter)
     n_dead = summarise(first, str(args.adapter))
+    report_magnitudes(first, args.adapter.name, scaling)
     if args.compare:
         second = load(args.compare)
         summarise(second, str(args.compare))
+        report_magnitudes(second, args.compare.name, scaling)
         compare(first, second, args.adapter.name, args.compare.name)
     print()
     return 1 if n_dead else 0

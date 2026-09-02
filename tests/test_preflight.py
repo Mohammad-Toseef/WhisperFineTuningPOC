@@ -47,12 +47,20 @@ CONFIG = ROOT / "config" / "training_config.yaml"
 B3_MANIFEST = ROOT / "data" / "processed" / "Batch3" / "manifest_reviewed.json"
 R1_MANIFEST = ROOT / "data" / "processed" / "manifest_reviewed.json"
 
-#: The round-2 holdout, pinned. Kept here as well as in --eval-episodes so a
+#: The eval holdout, pinned. Kept here as well as in --eval-episodes so a
 #: drift between the two is a test failure rather than a silent mismatch.
 SET_B = ["B3013", "B3017", "B3029", "B3031", "B3039", "B3051", "B3063", "B3076"]
 SET_A = ["EP5_vwzNL2oziZs", "EP6_SrVnpBqd7bI", "EP34_h87EJF0Zvco", "EP41_mBtP9NKha1g",
          "EP43_m8-37sgUwUQ", "EP44_paAJQ3OKB-8", "EP47_a0NiZST0S6Q"]
 EPOCHS = 3
+
+#: Rounds already on the volume. The current round's tag comes from the config, so
+#: these tests check INVARIANTS ("do not collide with anything already there",
+#: "resume from a round that exists") rather than one round's literal values —
+#: the previous version asserted run_tag == "r2" and failed on a correct round-3
+#: config, which is worse than no test because it trains people to ignore it.
+PRIOR_ROUNDS = ["", "r2"]          # "" is round 1, the untagged layout
+DATASET = "/data/processed/dataset_r2"   # round 3 reuses round 2's split, on purpose
 
 
 class Skipped(Exception):
@@ -96,17 +104,40 @@ def code_lines(block: str) -> list[str]:
     return out
 
 
+def func_src(src: str, name: str) -> str:
+    """Source of one top-level function, via AST.
+
+    Previously this sliced text from `def train(` to the Evaluation banner. When
+    probe() was added between them, that span silently covered TWO functions, so
+    ordering assertions could match statements in the wrong one. The AST cannot
+    drift that way.
+    """
+    for node in ast.walk(ast.parse(src)):
+        if isinstance(node, ast.FunctionDef) and node.name == name:
+            seg = ast.get_source_segment(src, node)
+            if seg:
+                return seg
+    raise AssertionError(f"function {name}() not found in modal_app.py")
+
+
 def train_block(src: str) -> str:
-    return src[src.index("def train("):src.index("# ── Evaluation")]
+    return func_src(src, "train")
 
 
 # ── config ────────────────────────────────────────────────────────────────────
-def test_round2_switches_are_on():
-    """run_tag / resume / dataset must all point at round 2, or this is not round 2."""
+def test_round_switches_are_on():
+    """A tagged run, resuming a round that exists, on the tagged dataset."""
+    m = _paths_module()
     cfg = load_cfg()
-    assert cfg["training"].get("run_tag") == "r2", cfg["training"].get("run_tag")
-    assert cfg["lora"].get("resume_from_adapter") == "/data/model/whisper-urdu-lora-adapter"
-    assert cfg["data"]["dataset_path"] == "/data/processed/dataset_r2"
+    tag = cfg["training"].get("run_tag")
+    assert tag, "run_tag is empty — this run would overwrite round 1's untagged paths"
+    assert tag not in PRIOR_ROUNDS, (
+        f"run_tag {tag!r} belongs to a round already on the volume")
+    resume = cfg["lora"].get("resume_from_adapter")
+    known = {m.adapter_path(t) for t in PRIOR_ROUNDS}
+    assert resume in known, (
+        f"resume_from_adapter {resume!r} is not a known round's adapter: {sorted(known)}")
+    assert cfg["data"]["dataset_path"] == DATASET
 
 
 def test_every_config_key_the_code_reads_exists():
@@ -132,8 +163,40 @@ def test_every_config_key_the_code_reads_exists():
 def test_learning_rate_is_a_float_not_a_string():
     """YAML reads 5.0e-6 as a float but a bare 5e-6 as the STRING '5e-6', which
     would reach the optimizer as a string."""
-    lr = load_cfg()["training"]["learning_rate"]
-    assert isinstance(lr, float), f"learning_rate parsed as {type(lr).__name__}: {lr!r}"
+    cfg = load_cfg()["training"]
+    for key in ("learning_rate", "encoder_learning_rate"):
+        lr = cfg[key]
+        assert isinstance(lr, float), f"{key} parsed as {type(lr).__name__}: {lr!r}"
+        assert 0 < lr < 1e-3, f"{key} = {lr!r} is not a plausible fine-tuning rate"
+
+
+def test_encoder_gets_its_own_optimizer_group():
+    """The encoder starts cold (lora_B all zero) while the decoder has trained
+    twice, so they need different rates. Two things must hold, and the second is
+    the one that silently fails: the config must set a distinct encoder rate, AND
+    the code must actually build parameter groups from it. A config key nothing
+    reads would leave the encoder on the decoder's rate and look configured.
+    """
+    cfg = load_cfg()["training"]
+    assert cfg["encoder_learning_rate"] >= cfg["learning_rate"], (
+        "a cold encoder should not train slower than the warm decoder: "
+        f"encoder {cfg['encoder_learning_rate']} < decoder {cfg['learning_rate']}")
+
+    src = MODAL_APP.read_text(encoding="utf-8")
+    lines = code_lines(src)
+    assert any('t_cfg["encoder_learning_rate"]' in l for l in lines), (
+        "encoder_learning_rate is in the yaml but nothing reads it")
+    # Both entry points must use the shared builder, or the probe verifies a
+    # construction the real run does not use.
+    for fn in ("train", "probe"):
+        assert any("build_dual_rate_optimizer" in l
+                   for l in code_lines(func_src(src, fn))), (
+            f"{fn}() does not use build_dual_rate_optimizer — the probe would then "
+            "verify a construction the real run does not use")
+    assert any("optimizers=(optimizer, None)" in l for l in lines), (
+        "the optimizer is built but never handed to the Trainer, or a scheduler "
+        "is passed alongside it — pass None so warmup/decay is built over these "
+        "groups rather than flattening them")
 
 
 def test_checkpoint_selection_is_coherent():
@@ -214,19 +277,23 @@ def _paths_module():
     return modal_app
 
 
-def test_round2_writes_nowhere_round1_lives():
-    """The whole point of run_tag. A collision here would have round 2 destroy the
-    artifact it resumes from."""
+def test_writes_nowhere_a_previous_round_lives():
+    """The whole point of run_tag. A collision here would destroy an artifact an
+    earlier round produced — including the one this run resumes from."""
     m = _paths_module()
     cfg = load_cfg()
     tag = cfg["training"]["run_tag"]
-    round1 = {m.adapter_path(""), m.final_model_path(""), "/data/processed/dataset",
-              "/data/checkpoints/whisper-large-v3-urdu", "/data/logs"}
-    round2 = {m.adapter_path(tag), m.final_model_path(tag),
-              cfg["data"]["dataset_path"], cfg["training"]["output_dir"],
-              cfg["training"]["logging_dir"]}
-    clash = round1 & round2
-    assert not clash, f"round-2 output collides with a round-1 path: {sorted(clash)}"
+    previous = {"/data/processed/dataset",
+                "/data/checkpoints/whisper-large-v3-urdu", "/data/logs"}
+    for t in PRIOR_ROUNDS:
+        previous |= {m.adapter_path(t), m.final_model_path(t)}
+        if t:
+            previous |= {f"/data/checkpoints/whisper-large-v3-urdu-{t}",
+                         f"/data/logs/{t}"}
+    current = {m.adapter_path(tag), m.final_model_path(tag),
+               cfg["training"]["output_dir"], cfg["training"]["logging_dir"]}
+    clash = previous & current
+    assert not clash, f"round-{tag} output collides with an earlier round: {sorted(clash)}"
 
 
 def test_resume_source_is_not_this_runs_output():
@@ -234,8 +301,9 @@ def test_resume_source_is_not_this_runs_output():
     m = _paths_module()
     cfg = load_cfg()
     resume = cfg["lora"]["resume_from_adapter"]
-    assert resume == m.adapter_path(""), "resume source should be round 1's adapter"
-    assert resume != m.adapter_path(cfg["training"]["run_tag"])
+    assert resume != m.adapter_path(cfg["training"]["run_tag"]), (
+        "resume_from_adapter is this run's OWN output — training would overwrite "
+        "the adapter it is continuing from")
 
 
 def test_eval_result_filenames_are_distinct_per_model():
@@ -244,9 +312,11 @@ def test_eval_result_filenames_are_distinct_per_model():
     judged against."""
     m = _paths_module()
     tag = load_cfg()["training"]["run_tag"]
-    names = {m.eval_results_path(tag, lbl) for lbl in
-             ("base", "whisper-urdu-final", "whisper-urdu-r2-final")}
-    assert len(names) == 3, names
+    labels = ["base"] + [f"whisper-urdu{('-' + t) if t else ''}-final"
+                         for t in PRIOR_ROUNDS] + [f"whisper-urdu-{tag}-final"]
+    names = {m.eval_results_path(tag, lbl) for lbl in labels}
+    assert len(names) == len(labels), (
+        f"eval filenames collide — only the last run would survive: {sorted(names)}")
     assert m.eval_results_path() == "/data/logs/eval_results.json", \
         "the untagged default must stay round 1's filename, so it is never rewritten"
 
@@ -297,6 +367,31 @@ def test_adapter_is_committed_before_the_merge():
     assert i_save < i_commit < i_merge, (
         f"order must be adapter-save -> commit -> merge; got "
         f"save={i_save} commit={i_commit} merge={i_merge}")
+
+
+def test_encoder_training_is_actually_enabled():
+    """Round 3's entire point. Rounds 1 and 2 trained the decoder only because the
+    REENTRANT checkpoint path builds no backward graph for a block whose inputs
+    carry no gradient — and Whisper's encoder input is a mel spectrogram.
+
+    Two halves, both required: the flag must say non-reentrant, AND the trainer
+    must actually be given it. Setting the config key without wiring it through
+    would look correct and change nothing — the same shape of silent no-op the
+    other guards exist for.
+    """
+    cfg = load_cfg()["training"]
+    assert cfg.get("gradient_checkpointing_use_reentrant") is False, (
+        "gradient_checkpointing_use_reentrant must be false, or the encoder's LoRA "
+        f"gets grad=None and 41% of the adapter trains nothing. Got "
+        f"{cfg.get('gradient_checkpointing_use_reentrant')!r}")
+    assert cfg.get("gradient_checkpointing") is True, (
+        "the use_reentrant flag only takes effect while checkpointing is on")
+
+    src = MODAL_APP.read_text(encoding="utf-8")
+    m = re.search(r"gradient_checkpointing_kwargs\s*=\s*\{([^}]*)\}", src)
+    assert m, ("Seq2SeqTrainingArguments never receives gradient_checkpointing_kwargs "
+               "— the config flag is read by nobody and the encoder stays frozen")
+    assert "use_reentrant" in m.group(1), m.group(1)
 
 
 def test_resume_load_passes_is_trainable():

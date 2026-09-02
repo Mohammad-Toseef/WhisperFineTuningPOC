@@ -4,7 +4,16 @@ model:
   task: "transcribe"
 
 lora:
-  # ── ROUND 2: continue round 1's adapter, do NOT build a fresh one ──
+  # ── ROUND 3: continue ROUND 1's adapter — the same starting point round 2 used ──
+  # NOT round 2's adapter, deliberately. Round 3 changes exactly one thing about
+  # round 2: the encoder now trains. Resuming round 2 instead would ALSO give the
+  # decoder a third pass over the same data, and any difference would be
+  # unattributable between "the encoder helped" and "more decoder training helped".
+  # Starting where round 2 started makes round 2 the control:
+  #     round 2 = round 1 adapter + dataset_r2 + 3 epochs @ 5e-6, decoder only
+  #     round 3 = round 1 adapter + dataset_r2 + 3 epochs @ 5e-6, decoder + encoder
+  # Nothing is discarded: round 3's decoder gets the same training round 2's did.
+  #
   # base large-v3 + this adapter IS the round-1 model (the base was frozen all
   # through round 1), so step 0 reproduces round 1's outputs exactly.
   # Unset this to go back to round 1's behaviour (a fresh adapter on the base).
@@ -36,14 +45,14 @@ training:
   # SOURCE, so without a tag the trainer would overwrite the adapter it is
   # resuming from, and evaluate() would overwrite the eval_results.json holding
   # round 1's 18.57% / 10.50%. Empty/unset reproduces round 1's layout.
-  #   adapter -> /data/model/whisper-urdu-r2-lora-adapter
-  #   merged  -> /data/model/whisper-urdu-r2-final
-  #   eval    -> /data/logs/eval_results-r2-*.json
-  run_tag: "r2"
+  #   adapter -> /data/model/whisper-urdu-r3-lora-adapter
+  #   merged  -> /data/model/whisper-urdu-r3-final
+  #   eval    -> /data/logs/eval_results-r3-*.json
+  run_tag: "r3"
 
-  # Tagged so round 1's checkpoints/logs are not mixed into this run's.
-  output_dir: "/data/checkpoints/whisper-large-v3-urdu-r2"   # r1: .../whisper-large-v3-urdu
-  logging_dir: "/data/logs/r2"                               # r1: /data/logs
+  # Tagged so neither round 1's nor round 2's checkpoints/logs are mixed in.
+  output_dir: "/data/checkpoints/whisper-large-v3-urdu-r3"   # r1: .../whisper-large-v3-urdu
+  logging_dir: "/data/logs/r3"                               # r1: /data/logs
 
   per_device_train_batch_size: 8   # large-v3 on A10G 24GB; drop to 4 if OOM
   per_device_eval_batch_size: 4
@@ -66,6 +75,22 @@ training:
   # MEASURED round 2, epoch 1: eval_wer_r1 = 15.80 raw -> preserved.
   learning_rate: 5.0e-6
 
+  # ── ROUND 3: the ENCODER gets its own, higher rate ──
+  # 5.0e-6 above is the DECODER's number, chosen to protect a half that has
+  # already trained twice on this domain. The encoder is in the opposite state:
+  # lora_B all zero, never updated, starting from nothing. One rate cannot serve
+  # both — at 5.0e-6 a cold encoder may barely move in 3 epochs, and the run
+  # would read as "the encoder does not help" when it simply did not get far.
+  #
+  # 1.0e-5 is round 1's rate, which is what a cold LoRA half was trained at
+  # successfully before. Applied via two optimizer parameter groups; the LR
+  # scheduler scales both proportionally, so warmup and decay still apply.
+  #
+  # This keeps round 3 a ONE-variable change against round 2 — "the encoder now
+  # trains, at a rate suited to a cold start". The decoder's treatment is
+  # untouched, so a Set A regression is still attributable.
+  encoder_learning_rate: 1.0e-5
+
   # ── Step schedule (step-based; no num_train_epochs) ──
   #   steps_per_epoch = ceil(n_train_clips / 32)      # eff-batch = 8 * 4
   #   max_steps       = steps_per_epoch * n_epochs
@@ -80,6 +105,27 @@ training:
                      # steps cannot jolt the resumed adapter
 
   gradient_checkpointing: true
+  # ── ROUND 3'S ONE REAL CHANGE: false makes the ENCODER train ──
+  # Rounds 1 and 2 both trained the DECODER ONLY. All 192 encoder LoRA modules
+  # (23,592,960 params, 41% of the adapter) never received a gradient, so they
+  # contributed B@A = 0@A = 0 to every forward pass.
+  #
+  # Cause: the REENTRANT checkpoint implementation decides whether to build a
+  # backward graph from the INPUTS of a checkpointed block; parameters inside it
+  # are invisible to that decision. Whisper's encoder input is a mel spectrogram
+  # through frozen convs, so requires_grad=False and no graph was built.
+  # `enable_input_require_grads()` only covers the DECODER, because for Whisper
+  # get_input_embeddings() is the decoder's embed_tokens.
+  #
+  # The non-reentrant implementation uses saved-tensor hooks instead and does not
+  # gate on the inputs, so trainable parameters inside the block get gradients.
+  # Verified locally on the same graph shape: reentrant leaves encoder A and B at
+  # grad=None, non-reentrant gives them real gradients, and backward() raises in
+  # NEITHER case — which is why this went unnoticed for two rounds.
+  #
+  # Confirm it worked from the end-of-run line: `weights moved` should report
+  # ~1024/1024 LoRA tensors, not round 2's 640/1024 (= the decoder alone).
+  gradient_checkpointing_use_reentrant: false
   fp16: true
   evaluation_strategy: "steps"
   # Once per epoch => 3 evals. save_steps must stay a multiple of eval_steps or
