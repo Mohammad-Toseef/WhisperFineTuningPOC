@@ -320,6 +320,24 @@ def transcribe_and_align(
 
     import align_to_srt as core
 
+    # Log the model INSIDE the container. The local entrypoint already echoes what
+    # it dispatched, but that proves only what was asked for -- it cannot show what
+    # the GPU actually loaded, and `model_path` arrives here as the 5th POSITIONAL
+    # argument of a starmap tuple, where a shifted argument would pass something
+    # else entirely without raising. The parameter default is round 1's model, so a
+    # caller that merely forgets the flag still gets a plausible transcript from a
+    # two-rounds-stale model. This line is the only server-side evidence of which
+    # weights ran, and it lands in `modal app logs`.
+    print(f"🔎 transcribing with model: {model_path}")
+    if model_path.startswith(VOLUME_PATH) and not os.path.isdir(model_path):
+        # Without this, transformers treats an unresolvable path as a Hub repo id
+        # and either fails obscurely or fetches something else. Fail here, naming
+        # the path, because a detached GPU stage is a bad place to discover it.
+        raise FileNotFoundError(
+            f"model_path {model_path!r} is not a directory on the volume. "
+            "Check --model-path; a POSIX path passed from Git Bash arrives "
+            "rewritten as C:/Program Files/Git/data/...")
+
     with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as handle:
         handle.write(audio_bytes)
         audio_path = handle.name
