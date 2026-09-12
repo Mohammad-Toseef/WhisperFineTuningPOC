@@ -48,3 +48,9 @@ Manifest_Analysis_Report.docx
 # and model output, per clip), so they are corpus data, not code — same reason
 # data/ is ignored. Regenerate with scripts/triage_errors.py --html.
 reports/
+
+# Live-stream pipeline output: downloaded source tracks, local slices, and their
+# transcripts. Same reasoning as data/ above — regenerable via
+# run_stream_pipeline.py, not source, and the source tracks alone run 400+ MB
+# each.
+ALRA_TV_LIVE_STREAMS/

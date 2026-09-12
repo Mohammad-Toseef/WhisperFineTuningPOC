@@ -434,6 +434,70 @@ def compare_reports(current: list[dict], previous_path: Path) -> None:
         print("  no metric moved beyond its noise tolerance")
 
 
+ACCEPTED_FILENAME = "qa_accepted.json"
+
+
+def load_accepted(path) -> dict:
+    """Human decisions to accept a SPECIFIC failure, keyed by label.
+
+        data/<batch>/qa_accepted.json
+        {
+          "B4027": {
+            "reason": "code-switch: Urdu aligner cannot time English words ...",
+            "failures": ["2 cue(s) over 10.0 w/s"]
+          }
+        }
+
+    WHY THIS EXISTS. The gate re-scores every finished episode on each run, so one
+    investigated-and-accepted episode makes the exit code non-zero forever. That
+    turns the gate into noise: the operator starts reading past a red result, and
+    the next genuine failure hides in it. B4033 was only caught because the run
+    before it had NOT been switched to --warn-only, so the blunt alternative
+    demonstrably costs findings.
+
+    ACCEPTANCE IS PER FAILURE, NOT PER EPISODE. A stored entry matches by PREFIX,
+    so a new or worsened defect in the same episode still fails: accepting
+    "coverage 94.2%" does not accept "coverage 71.0%", and accepting
+    "2 cue(s) over 10.0 w/s" does not accept "5 cue(s) over 10.0 w/s". The counts
+    are in the message on purpose. Blanket-accepting a label would swallow exactly
+    the class of silent defect this pipeline keeps producing.
+
+    `reason` is required and never read by code -- it exists so the decision is
+    auditable six weeks later, in the same spirit as repetition_exclusions.json.
+    """
+    from pathlib import Path as _Path
+    p = _Path(path) / ACCEPTED_FILENAME
+    if not p.is_file():
+        return {}
+    try:
+        raw = json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise SystemExit(f"{p} is unreadable ({exc}); fix or remove it")
+    out = {}
+    for label, entry in raw.items():
+        if not isinstance(entry, dict) or not entry.get("reason"):
+            raise SystemExit(
+                f"{p}: {label} needs a non-empty 'reason' — an accepted failure "
+                "without a recorded justification is indistinguishable from one "
+                "nobody looked at")
+        out[label] = {"reason": entry["reason"],
+                      "failures": list(entry.get("failures") or [])}
+    return out
+
+
+def split_accepted(failures: list, entry: dict | None) -> tuple[list, list]:
+    """(blocking, accepted) — prefix match, so a worsened defect still blocks."""
+    if not entry:
+        return list(failures), []
+    blocking, accepted = [], []
+    for f in failures:
+        if any(f.startswith(pattern) for pattern in entry["failures"]):
+            accepted.append(f)
+        else:
+            blocking.append(f)
+    return blocking, accepted
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -474,6 +538,21 @@ def main() -> None:
     reports = [measure(stem, paths, grouped.get(stem, []), limits,
                        exclusions.get(stem), chant_units) for stem in stems]
 
+    # Split each episode's failures into blocking and accepted. Done here, before
+    # anything is printed or written, so the report file records the same verdict
+    # the operator sees and a later --compare cannot disagree with it.
+    # Lives beside the batch's other bookkeeping (logs/, qa_reports/), not in
+    # data/processed/, because it is a decision about THIS batch's QA run rather
+    # than about the dataset those chunks belong to.
+    accepted_map = load_accepted(BatchPaths(args.batch).root)
+    for r in reports:
+        entry = accepted_map.get(r["label"])
+        blocking, accepted = split_accepted(r["failures"], entry)
+        r["failures"] = blocking
+        if accepted:
+            r["accepted_failures"] = accepted
+            r["accepted_reason"] = entry["reason"]
+
     # "gap s" is raw uncovered time; "spch s"/"lost%" is the part of it VAD calls speech --
     # the number the gate rules on. Showing both makes the correction visible instead of
     # replacing one opaque figure with another.
@@ -483,7 +562,10 @@ def main() -> None:
     print(header)
     print("-" * len(header))
     for r in reports:
-        mark = "FAIL" if r["failures"] else "pass"
+        # ACCEPT is deliberately its own marker, not "pass": the defect is still
+        # there and the table should keep saying so.
+        mark = ("FAIL" if r["failures"]
+                else "ACCEPT" if r.get("accepted_failures") else "pass")
         # An unscored episode has no speech figure; "-" beats printing the raw seconds
         # twice, which would read as "VAD says all of it is speech".
         speech = (f"{r['gap_speech_seconds']:8.0f}" if "gap_speech_seconds" in r
@@ -497,12 +579,17 @@ def main() -> None:
               f"  {mark}")
 
     failed = [r for r in reports if r["failures"]]
+    accepted = [r for r in reports if r.get("accepted_failures")]
     for r in reports:
         for note in r["notes"]:
             print(f"\n  note  {r['label']}: {note}")
     for r in failed:
         print(f"\n  FAIL  {r['label']}")
         for failure in r["failures"]:
+            print(f"          - {failure}")
+    for r in accepted:
+        print(f"\n  ACCEPT  {r['label']} — {r['accepted_reason']}")
+        for failure in r["accepted_failures"]:
             print(f"          - {failure}")
 
     # Compare BEFORE writing: --compare and --json usually point at the same directory, so
@@ -528,14 +615,21 @@ def main() -> None:
             "inputs": {"srt_dir": str(paths.srt_dir), "transcript_dir": str(paths.transcript_dir),
                        "audio_dir": str(paths.audio_trimmed), "vad_dir": str(paths.vad_dir),
                        "processed_dir": str(paths.processed_dir)},
-            "passed": len(reports) - len(failed),
+            "passed": len(reports) - len(failed) - len(accepted),
             "failed": len(failed),
+            # Recorded so a later --compare can tell "fixed" from "accepted", and
+            # so the file says which decisions were in force when it was written.
+            "accepted": {r["label"]: {"reason": r["accepted_reason"],
+                                      "failures": r["accepted_failures"]}
+                         for r in accepted},
             "episodes": reports,
         }
         out.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
         print(f"\nWrote {out}")
 
-    print(f"\n{len(reports) - len(failed)} passed | {len(failed)} failed")
+    tail = f" | {len(accepted)} accepted" if accepted else ""
+    print(f"\n{len(reports) - len(failed) - len(accepted)} passed | "
+          f"{len(failed)} failed{tail}")
     if failed and not args.warn_only:
         raise SystemExit(
             f"QA gate FAILED for {len(failed)} episode(s): "
