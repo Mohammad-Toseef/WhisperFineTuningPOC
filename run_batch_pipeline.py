@@ -113,6 +113,16 @@ class RunLog:
         self.path = path
         self.file = path.open("w", encoding="utf-8", errors="replace")
         self.terminal = sys.stdout
+        # child_environment() fixes the CHILDREN's stdio; this fixes OURS. When the driver's
+        # own stdout is a pipe or a file rather than a console (`| tee`, `> run.log`, or any
+        # wrapper that captures output), Python picks cp1252 on Windows and the first ✓ that
+        # arrives from a child kills the driver mid-stage. Observed for real: B4051-B4055 lost
+        # stages 5-6 that way, 8 minutes of GPU work already spent. errors="replace" so a
+        # terminal that genuinely cannot render a glyph degrades instead of raising.
+        try:
+            self.terminal.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError, OSError):
+            pass
 
     def write(self, text: str) -> int:
         self.terminal.write(text)
